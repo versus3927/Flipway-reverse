@@ -28,18 +28,25 @@ jobs:
           cache: 'npm'
 
       - name: Setup Java 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK 36 components
+      - name: Configure Android SDK 36
         run: |
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
+          SDKMGR=$(find "$SDK_DIR/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n 1)
+          if [ -n "$SDKMGR" ]; then
+            yes | "$SDKMGR" --sdk_root="$SDK_DIR" --licenses >/dev/null 2>&1 || true
+            "$SDKMGR" --sdk_root="$SDK_DIR" "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+          else
+            echo "sdkmanager not found under $SDK_DIR"
+            ls -la "$SDK_DIR"
+            exit 1
+          fi
 
       - name: Build web bundle
         run: |
@@ -53,6 +60,7 @@ jobs:
           npx cap init "GRAVI-RAN" com.gravi.ran --web-dir=dist
           npx cap add android
           npx cap sync android
+          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
@@ -60,21 +68,21 @@ jobs:
       - name: Prepare APK output
         run: |
           mkdir -p apk
-          cp android/app/build/outputs/apk/debug/app-debug.apk apk/gravi-ran-debug.apk
-          ls -lh apk/gravi-ran-debug.apk
+          cp android/app/build/outputs/apk/debug/app-debug.apk apk/gravi-ran.apk
+          ls -lh apk/gravi-ran.apk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gravi-ran-debug-apk
-          path: apk/gravi-ran-debug.apk
+          name: gravi-ran-apk
+          path: apk/gravi-ran.apk
 
       - name: Commit APK to branch
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f apk/gravi-ran-debug.apk
+          git add -f apk/gravi-ran.apk
           if ! git diff --cached --quiet; then
             git commit -m "Add built Android APK [skip ci]"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
+            git push origin "HEAD:refs/heads/${GITHUB_REF_NAME}"
           fi
