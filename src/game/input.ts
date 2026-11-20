@@ -15,7 +15,9 @@ export class Input {
     this.cb = cb;
     window.addEventListener('keydown', this.onKey);
     el.addEventListener('touchstart', this.onTS, { passive: false });
+    el.addEventListener('touchmove', this.onTM, { passive: false });
     el.addEventListener('touchend', this.onTE, { passive: false });
+    el.addEventListener('touchcancel', this.onTC, { passive: false });
     el.addEventListener('mousedown', this.onMouse);
     el.addEventListener('contextmenu', this.onCtx);
   }
@@ -42,6 +44,22 @@ export class Input {
     this.tracking = true;
   };
 
+  private onTM = (e: TouchEvent) => {
+    if (this.disposed || !this.tracking) return;
+    e.preventDefault();
+    const t = e.changedTouches[0];
+    const dx = t.clientX - this.tsx;
+    const dy = t.clientY - this.tsy;
+    const ax = Math.abs(dx), ay = Math.abs(dy);
+    if (ax > 28 && ax > ay * 1.15) {
+      this.tracking = false;
+      this.cb(dx > 0 ? 'right' : 'left');
+    } else if (ay > 30 && ay > ax * 1.15) {
+      this.tracking = false;
+      this.cb(dy > 0 ? 'down' : 'up');
+    }
+  };
+
   private onTE = (e: TouchEvent) => {
     if (this.disposed || !this.tracking) return;
     e.preventDefault();
@@ -51,10 +69,14 @@ export class Input {
     const dy = t.clientY - this.tsy;
     const dt = performance.now() - this.tst;
     const ax = Math.abs(dx), ay = Math.abs(dy);
-    if (ax > 42 && ax > ay) this.cb(dx > 0 ? 'right' : 'left');
-    else if (ay > 44 && dy > 0) this.cb('down');   // свайп вниз — кувырок
-    else if (ay > 44 && dy < 0) this.cb('up');     // свайп вверх — прыжок
+    if (ax > 28 && ax > ay) this.cb(dx > 0 ? 'right' : 'left');
+    else if (ay > 30 && dy > 0) this.cb('down');   // свайп вниз — кувырок
+    else if (ay > 30 && dy < 0) this.cb('up');     // свайп вверх — прыжок
     else if (ax < 22 && ay < 22 && dt < 450) this.cb('action'); // тап — сальто
+  };
+
+  private onTC = () => {
+    this.tracking = false;
   };
 
   private onMouse = (e: MouseEvent) => {
@@ -66,7 +88,9 @@ export class Input {
     this.disposed = true;
     window.removeEventListener('keydown', this.onKey);
     this.el.removeEventListener('touchstart', this.onTS);
+    this.el.removeEventListener('touchmove', this.onTM);
     this.el.removeEventListener('touchend', this.onTE);
+    this.el.removeEventListener('touchcancel', this.onTC);
     this.el.removeEventListener('mousedown', this.onMouse);
     this.el.removeEventListener('contextmenu', this.onCtx);
   }

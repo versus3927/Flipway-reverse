@@ -97,7 +97,8 @@ export class Game {
       powerPreference: 'high-performance',
       stencil: false,
     });
-    this.renderer.setPixelRatio(this.lowSpec ? Math.min(window.devicePixelRatio || 1, 0.85) : Math.min(window.devicePixelRatio || 1, 1.5));
+    const initDpr = window.devicePixelRatio || 1;
+    this.renderer.setPixelRatio(this.lowSpec ? Math.min(initDpr, 1.5) : Math.min(initDpr, 2));
     this.renderer.setSize(mount.clientWidth, mount.clientHeight);
     this.renderer.toneMapping = this.lowSpec ? THREE.NoToneMapping : THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 0.94;
@@ -272,8 +273,8 @@ export class Game {
   private applyPerfProfile() {
     const dpr = window.devicePixelRatio || 1;
     const targetDpr = this.lowSpec
-      ? Math.min(dpr, this.ultraLow ? 0.72 : 0.85)
-      : Math.min(dpr, 1.5);
+      ? Math.min(dpr, this.ultraLow ? 1.15 : 1.5)
+      : Math.min(dpr, 2);
     this.renderer.setPixelRatio(targetDpr);
     this.renderer.toneMapping = this.lowSpec ? THREE.NoToneMapping : THREE.ACESFilmicToneMapping;
 
@@ -338,7 +339,9 @@ export class Game {
     if (a === 'pause') { this.togglePause(); return; }
     if (this.state !== 'play' || this.paused) return;
     if (a === 'left' || a === 'right') {
-      const dir = a === 'left' ? -1 : 1;
+      const screenDir = a === 'left' ? -1 : 1;
+      // Когда камера перевёрнута на потолок, экранные право/лево инвертированы относительно мировой оси X
+      const dir = (this.camRotZ > Math.PI / 2 ? -screenDir : screenDir) as -1 | 1;
       const targetLane = this.player.lane + dir;
       if (targetLane < 0 || targetLane > 2) return;
       const targetX = this.player.laneX(targetLane);
@@ -573,6 +576,7 @@ export class Game {
           if (onCeiling && c.y1 < 3.2) continue;
           if (!onCeiling && c.y0 > 3.2) continue;
           if (pb.y0 > c.y1 - 0.12 && !onCeiling) continue;
+          if (pb.y1 < c.y0 + 0.12 && onCeiling) continue;
           if (this.invulnT > 0) continue;
 
           const ovX = (c.w / 2 + 0.34) - Math.abs(c.x - pb.x);

@@ -509,7 +509,8 @@ export class Player {
       this.body.rotation.x = 0.1 + Math.sin(p * 2) * 0.02;
       const bob = Math.abs(Math.sin(p)) * 0.06;
       const vx = this.laneT < 1 ? (this.toX - this.fromX) : 0;
-      this.body.rotation.z = THREE.MathUtils.clamp(-vx * 0.18 * (1 - this.laneT), -0.42, 0.42);
+      const leanDir = this.flipT > 0.5 ? 1 : -1;
+      this.body.rotation.z = THREE.MathUtils.clamp(vx * leanDir * 0.18 * (1 - this.laneT), -0.42, 0.42);
       this.headG.rotation.y = Math.sin(t * 0.8) * 0.07;
       this.headG.rotation.z = Math.sin(p) * 0.04;
       // оглушён — шатает из стороны в сторону
