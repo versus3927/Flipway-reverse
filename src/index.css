@@ -98,3 +98,18 @@ canvas { display: block; }
   -webkit-backdrop-filter: blur(14px);
   border: 1px solid rgba(255,255,255,0.09);
 }
+
+.low-spec .glass {
+  background: rgba(8, 10, 22, 0.86);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.low-spec [class*="backdrop-blur"] {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.low-spec .scanlines {
+  display: none;
+}

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+android/
+.gradle/
+capacitor.config.json
+capacitor.config.ts
+*.log

@@ -9,6 +9,8 @@ export class SFX {
   private nextT = 0;
   private schedTimer: number | null = null;
   private root = 55;
+  private hatBuf: AudioBuffer | null = null;
+  private hatFilter: BiquadFilterNode | null = null;
 
   ensure() {
     if (this.ctx) {
@@ -24,6 +26,14 @@ export class SFX {
     this.musicGain = this.ctx.createGain();
     this.musicGain.gain.value = 0.32;
     this.musicGain.connect(this.master);
+    const len = Math.floor(this.ctx.sampleRate * 0.03);
+    this.hatBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const d = this.hatBuf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    this.hatFilter = this.ctx.createBiquadFilter();
+    this.hatFilter.type = 'highpass';
+    this.hatFilter.frequency.value = 7000;
+    this.hatFilter.connect(this.musicGain);
   }
 
   setMuted(m: boolean) {
@@ -33,8 +43,16 @@ export class SFX {
     }
   }
 
+  suspend() {
+    if (this.ctx && this.ctx.state === 'running') this.ctx.suspend();
+  }
+
+  resume() {
+    if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+  }
+
   private tone(f0: number, f1: number, dur: number, type: OscillatorType, vol: number, delay = 0, dest?: AudioNode) {
-    if (!this.ctx) return;
+    if (!this.ctx || this.muted || this.ctx.state !== 'running') return;
     const t = this.ctx.currentTime + delay;
     const o = this.ctx.createOscillator();
     const g = this.ctx.createGain();
@@ -49,7 +67,7 @@ export class SFX {
   }
 
   private noise(dur: number, vol: number, fc: number, delay = 0, q = 1) {
-    if (!this.ctx) return;
+    if (!this.ctx || this.muted || this.ctx.state !== 'running') return;
     const t = this.ctx.currentTime + delay;
     const len = Math.max(1, Math.floor(this.ctx.sampleRate * dur));
     const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
@@ -127,7 +145,8 @@ export class SFX {
   }
 
   private schedule() {
-    if (!this.ctx || !this.musicOn) return;
+    if (!this.ctx || !this.musicOn || this.ctx.state !== 'running') return;
+    if (this.muted) { this.nextT = this.ctx.currentTime + 0.1; return; }
     const STEP = 60 / 132 / 2; // восьмые при 132 BPM
     while (this.nextT < this.ctx.currentTime + 0.28) {
       const s = this.step % 32;
@@ -138,17 +157,14 @@ export class SFX {
       if (s % 4 === 0) this.tone(r * 2, r * 2, 0.16, 'sawtooth', 0.16, delay, this.musicGain);
       if (s % 8 === 4) this.tone(r * 1.5 * 2, r * 1.5 * 2, 0.14, 'sawtooth', 0.13, delay, this.musicGain);
       if (s % 8 === 6) this.tone(r * 2, r * 2.66, 0.1, 'sawtooth', 0.1, delay, this.musicGain);
-      // хэты
-      if (s % 2 === 0) {
+      // хэты (переиспользуемый буфер)
+      if (s % 2 === 0 && this.hatBuf && this.hatFilter) {
         const t = this.ctx.currentTime + delay;
-        const len = Math.floor(this.ctx.sampleRate * 0.03);
-        const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
-        const d = buf.getChannelData(0);
-        for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
-        const src = this.ctx.createBufferSource(); src.buffer = buf;
-        const f = this.ctx.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = 7000;
-        const g = this.ctx.createGain(); g.gain.value = s % 8 === 4 ? 0.09 : 0.05;
-        src.connect(f).connect(g).connect(this.musicGain);
+        const src = this.ctx.createBufferSource();
+        src.buffer = this.hatBuf;
+        const g = this.ctx.createGain();
+        g.gain.value = s % 8 === 4 ? 0.09 : 0.05;
+        src.connect(g).connect(this.hatFilter);
         src.start(t);
       }
       // пэд раз в такт

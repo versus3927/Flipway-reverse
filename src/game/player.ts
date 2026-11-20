@@ -141,7 +141,7 @@ export class Player {
     scene.add(this.group);
 
     // след скорости
-    this.trail = sprite(0x3ddcff, 2.6, 0.0);
+    this.trail = sprite(0x3ddcff, 2.6, 0.0, true);
     this.group.add(this.trail);
 
     // ── звёздочки, кружащие над головой при оглушении ──
@@ -177,12 +177,13 @@ export class Player {
   }
 
   private lanesArr() { return this.laneSet === 'castle' ? CASTLE_LANES : LANES; }
+  laneX(l: number) { return this.lanesArr()[Math.min(2, Math.max(0, l))]; }
   targetX() { return this.lanesArr()[this.lane]; }
 
   setLaneSet(s: 'std' | 'castle') {
     if (this.laneSet === s) return;
     this.laneSet = s;
-    this.glideTo(this.targetX(), 1.15);
+    this.glideTo(this.targetX(), 0.72);
   }
 
   setMode(m: MoveMode) { this.mode = m; }
@@ -198,6 +199,14 @@ export class Player {
     this.lane = nl;
     this.glideTo(this.targetX(), 0.28); // плавнее: было 0.17
     return true;
+  }
+
+  /** Отскок в сторону при боковом задевании — возвращает на безопасную дорожку */
+  bounceToSide(dir: -1 | 1) {
+    if (this.dead) return;
+    const nl = Math.min(2, Math.max(0, this.lane + dir));
+    this.lane = nl;
+    this.glideTo(this.targetX(), 0.18);
   }
 
   primary(): 'flip' | 'jump' | null {
@@ -370,7 +379,7 @@ export class Player {
     this.jumpT = 1; this.jumpY = 0; this.jumping = false;
     this.platformY = 0; this.baseY = 0; this.fallV = 0;
     this.onTrain = false; this.justBoarded = false;
-    this.rolling = false; this.rollT = 1;
+    this.rolling = false; this.rollT = 1; this.rollQueued = false;
     this.starT = 0; this.stunned = false; this.stars.visible = false;
     this.laneSet = 'std'; this.mode = 'flip';
     this.rig.rotation.set(0, 0, 0);
