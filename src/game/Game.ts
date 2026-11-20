@@ -1,9 +1,5 @@
 import * as THREE from 'three';
-import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
-import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
-import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
-import { LOCS, LocId, TUNNEL_H, css, rand } from './config';
+import { GEN_AHEAD, LOCS, LocId, TUNNEL_H, css, rand } from './config';
 import { World } from './world';
 import { Player } from './player';
 import { Particles, SpeedStreaks } from './particles';
@@ -21,6 +17,7 @@ export interface GameCallbacks {
   pauseChange(p: boolean): void;
   /** Запущено окно «на грани»: t секунд до безопасности (0 — снято) */
   graze(t: number): void;
+  perfMode?(low: boolean): void;
 }
 
 const lerpC = (a: THREE.Color, b: THREE.Color, k: number) => {
@@ -37,9 +34,8 @@ export class Game {
   private rim: THREE.DirectionalLight;
   private ambient: THREE.AmbientLight;
   private heroLight: THREE.PointLight;
-  private composer: EffectComposer;
-  private bloom: UnrealBloomPass;
   private lowSpec: boolean;
+  private manualPerfOverride: boolean;
 
   private world: World;
   private player: Player;
@@ -51,6 +47,7 @@ export class Game {
 
   private state: 'menu' | 'play' | 'dying' | 'dead' = 'menu';
   private paused = false;
+  private needPausedRender = false;
   private pz = 0;
   private speed = 0;
   private dist = 0;
@@ -73,6 +70,8 @@ export class Game {
   private t = 0;
   private camFov = 62;
   private camRotZ = 0; // угол переворота камеры
+  private exitCastleTimer: number | null = null;
+  private slowFrames = 0;
 
   // цветовые цели для плавного перехода локаций
   private tgt = {
@@ -87,86 +86,72 @@ export class Game {
 
   constructor(private mount: HTMLElement, cb: GameCallbacks) {
     this.cb = cb;
-    // качество: слабые/мобильные устройства — без теней, лёгкий bloom
+    const saved = localStorage.getItem('gr_low');
+    this.manualPerfOverride = saved === '1' || saved === '0';
     const isTouch = matchMedia('(pointer: coarse)').matches;
     const cores = navigator.hardwareConcurrency ?? 4;
-    this.lowSpec = isTouch || cores <= 4;
+    this.lowSpec = saved === '1' ? true : saved === '0' ? false : (isTouch || cores <= 4);
 
-    // на мобильных антиалиас не нужен (высокий DPI итак сглаживает), экономим GPU
-    this.renderer = new THREE.WebGLRenderer({ antialias: !this.lowSpec, powerPreference: 'high-performance' });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer = new THREE.WebGLRenderer({
+      antialias: !this.lowSpec,
+      powerPreference: 'high-performance',
+      stencil: false,
+    });
+    this.renderer.setPixelRatio(this.lowSpec ? 1 : Math.min(window.devicePixelRatio || 1, 1.5));
     this.renderer.setSize(mount.clientWidth, mount.clientHeight);
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.12;
-    if (!this.lowSpec) {
-      this.renderer.shadowMap.enabled = true;
-      this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    }
+    this.renderer.toneMappingExposure = 0.94;
+    this.renderer.shadowMap.enabled = !this.lowSpec;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
     mount.appendChild(this.renderer.domElement);
 
     this.scene.background = new THREE.Color(LOCS.metro.bg);
     this.scene.fog = new THREE.Fog(LOCS.metro.fog, LOCS.metro.fogNear, LOCS.metro.fogFar);
 
-    this.camera = new THREE.PerspectiveCamera(62, mount.clientWidth / mount.clientHeight, 0.1, 420);
+    this.camera = new THREE.PerspectiveCamera(
+      62,
+      Math.max(1, mount.clientWidth) / Math.max(1, mount.clientHeight),
+      0.1,
+      this.lowSpec ? 165 : 275
+    );
     this.camera.position.set(0, 3.1, 8.6);
 
     this.hemi = new THREE.HemisphereLight(LOCS.metro.hemiSky, LOCS.metro.hemiGround, LOCS.metro.hemiInt);
     this.scene.add(this.hemi);
+
     this.dir = new THREE.DirectionalLight(LOCS.metro.sunColor, LOCS.metro.sunInt);
     this.dir.position.set(8, 16, 6);
-    if (!this.lowSpec) {
-      this.dir.castShadow = true;
-      this.dir.shadow.mapSize.set(1024, 1024);
-      const sc = this.dir.shadow.camera as THREE.OrthographicCamera;
-      sc.left = -13; sc.right = 13; sc.top = 16; sc.bottom = -13;
-      sc.near = 1; sc.far = 62;
-      this.dir.shadow.bias = -0.0022;
-      this.dir.shadow.normalBias = 0.03;
-      this.scene.add(this.dir.target);
-    }
+    this.dir.castShadow = !this.lowSpec;
+    this.dir.shadow.mapSize.set(512, 512);
+    const sc = this.dir.shadow.camera as THREE.OrthographicCamera;
+    sc.left = -13; sc.right = 13; sc.top = 16; sc.bottom = -13;
+    sc.near = 1; sc.far = 62;
+    this.dir.shadow.bias = -0.0022;
+    this.dir.shadow.normalBias = 0.03;
+    this.scene.add(this.dir.target);
     this.scene.add(this.dir);
 
-    // мягкий заполняющий свет — тени остаются читаемыми
     this.ambient = new THREE.AmbientLight(0xffffff, 0.3);
     this.scene.add(this.ambient);
 
-    // контровой свет — объём и красивый силуэт
-    this.rim = new THREE.DirectionalLight(0x8fdcff, 0.7);
+    this.rim = new THREE.DirectionalLight(0x8fdcff, 0.4);
     this.rim.position.set(-10, 7, -14);
     this.scene.add(this.rim);
 
-    this.point = new THREE.PointLight(LOCS.metro.accent2, 22, 30, 2);
+    this.point = new THREE.PointLight(LOCS.metro.accent2, 3, 28, 2);
     this.scene.add(this.point);
 
-    // персональная подсветка героя
-    this.heroLight = new THREE.PointLight(0xffffff, 9, 9, 2);
+    this.heroLight = new THREE.PointLight(0xffffff, 8, 9, 2);
     this.scene.add(this.heroLight);
 
     this.world = new World(this.scene);
     this.world.shadows = !this.lowSpec;
     this.player = new Player(this.scene);
-    if (!this.lowSpec) {
-      this.player.group.traverse((c) => {
-        const m = c as THREE.Mesh;
-        if (m.isMesh) { m.castShadow = true; m.receiveShadow = true; }
-      });
-    }
     this.particles = new Particles(this.scene);
     this.streaks = new SpeedStreaks(this.scene);
 
-    // ── постобработка: bloom для неона и солнца ──
-    this.composer = new EffectComposer(this.renderer);
-    this.composer.addPass(new RenderPass(this.scene, this.camera));
-    this.bloom = new UnrealBloomPass(
-      new THREE.Vector2(mount.clientWidth, mount.clientHeight),
-      this.lowSpec ? 0.55 : 0.8,  // сила
-      0.85,                        // радиус
-      this.lowSpec ? 0.35 : 0.24   // порог
-    );
-    this.composer.addPass(this.bloom);
-    this.composer.addPass(new OutputPass());
-
     this.applyPerfProfile();
+    this.cb.perfMode?.(this.lowSpec);
     this.best = Number(localStorage.getItem('gr_best') || 0);
 
     this.input = new Input(this.renderer.domElement, (a) => this.onAction(a));
@@ -180,8 +165,16 @@ export class Game {
     this.raf = requestAnimationFrame(loop);
   }
 
+  private clearPendingTimers() {
+    if (this.exitCastleTimer !== null) {
+      clearTimeout(this.exitCastleTimer);
+      this.exitCastleTimer = null;
+    }
+  }
+
   // ─────────────────────────── публичное ───────────────────────────
   start() {
+    this.clearPendingTimers();
     this.sfx.ensure();
     this.sfx.startMusic();
     this.sfx.uiClick();
@@ -191,14 +184,16 @@ export class Game {
     this.dist = 0;
     this.coinCount = 0;
     this.elapsed = 0;
-    this.speed = 22; // Быстрее со старта! (было 15)
+    this.speed = 19;
     this.oncT = 6.5;
     this.shake = 0;
     this.timeScale = 1;
+    this.dieTimer = 0;
     this.nextMile = 500;
     this.grazeWindow = 0;
     this.invulnT = 0;
     this.fireT = 3.5;
+    this.slowFrames = 0;
     this.cb.graze(0);
     this.world.setPugPack(false);
     this.world.setBossDragon(false);
@@ -207,20 +202,24 @@ export class Game {
     this.snapColors(LOCS.metro);
     this.state = 'play';
     this.paused = false;
+    this.needPausedRender = false;
     this.cb.state('play');
     this.cb.loc('metro');
-    this.cb.banner('НЕОН-СИТИ', 'Погнали! Уворачивайся от поездов', css(LOCS.metro.accent));
-    this.cb.hud({ dist: 0, coins: 0, speed: 54, best: this.best, onTrain: false });
+    this.cb.banner('СВЕТЛЫЙ ВОКЗАЛ', 'Погнали! Уворачивайся от поездов', css(LOCS.metro.accent));
+    this.cb.hud({ dist: 0, coins: 0, speed: Math.round(this.speed * 3.6), best: this.best, onTrain: false });
   }
 
   toMenu() {
+    this.clearPendingTimers();
     this.world.setPugPack(false);
     this.world.setBossDragon(false);
+    this.world.clearFire();
     this.world.reset();
     this.player.reset();
     this.pz = 0;
     this.state = 'menu';
     this.paused = false;
+    this.needPausedRender = false;
     this.timeScale = 1;
     this.curLoc = 'metro';
     this.snapColors(LOCS.metro);
@@ -230,10 +229,12 @@ export class Game {
   togglePause() {
     if (this.state !== 'play' && this.state !== 'dying') return;
     this.paused = !this.paused;
+    this.needPausedRender = this.paused;
     this.cb.pauseChange(this.paused);
-    if (this.sfx) {
-      if (this.paused) (this.sfx as unknown as { ctx?: AudioContext }).ctx?.suspend();
-      else (this.sfx as unknown as { ctx?: AudioContext }).ctx?.resume();
+    if (this.paused) this.sfx.suspend();
+    else {
+      this.last = performance.now();
+      this.sfx.resume();
     }
   }
 
@@ -242,12 +243,11 @@ export class Game {
   }
 
   suspendAudio() {
-    (this.sfx as unknown as { ctx?: AudioContext }).ctx?.suspend();
+    this.sfx.suspend();
   }
 
   resumeAudio() {
-    // звук возобновляется, если только не стоит на паузе в игре
-    if (!this.paused) (this.sfx as unknown as { ctx?: AudioContext }).ctx?.resume();
+    if (!this.paused) this.sfx.resume();
   }
 
   setMuted(m: boolean) {
@@ -255,64 +255,62 @@ export class Game {
     this.sfx.setMuted(m);
   }
 
-  /** Оптимизация для слабых телефонов.
-   *  Разрешение НЕ снижается — убираем тени, bloom, декоративные частицы, спрайты скорости. */
+  /** Оптимизация для слабых телефонов */
   setOptimizationMode(on: boolean) {
+    this.manualPerfOverride = true;
     this.lowSpec = on;
     this.applyPerfProfile();
   }
 
   private applyPerfProfile() {
     const dpr = window.devicePixelRatio || 1;
-    this.renderer.setPixelRatio(Math.min(dpr, 2));
+    this.renderer.setPixelRatio(this.lowSpec ? 1 : Math.min(dpr, 1.5));
 
-    // тени — самый тяжёлый элемент
+    // Тени — отключаем полностью в lowSpec
     this.renderer.shadowMap.enabled = !this.lowSpec;
     this.world.shadows = !this.lowSpec;
     this.dir.castShadow = !this.lowSpec;
 
-    // bloom — полностью отключаем проход на слабых (экономит целый рендер-пасс)
-    this.bloom.strength = this.lowSpec ? 0.0 : 0.14;
-    this.bloom.radius = this.lowSpec ? 0.0 : 0.85;
-    this.bloom.threshold = this.lowSpec ? 999 : 0.9; // порог 999 = ничего не светится
+    // Отключаем лишние динамические источники света на слабых GPU
+    this.heroLight.visible = !this.lowSpec;
+    this.rim.visible = !this.lowSpec;
+    this.point.visible = !this.lowSpec;
 
-    // лишние источники света — отключаем
-    this.heroLight.intensity = this.lowSpec ? 0 : 9;
-    this.rim.intensity = this.lowSpec ? 0 : 0.4;
-    this.point.intensity = this.lowSpec ? 0 : 3;
-
-    // тени на объектах
     this.player.group.traverse((c) => {
       const m = c as THREE.Mesh;
       if (!m.isMesh) return;
       m.castShadow = !this.lowSpec;
       m.receiveShadow = !this.lowSpec;
     });
-
-    // частицы — значительно меньше
-    this.particles.lowSpec = this.lowSpec;
-
-    // туман ближе — меньше объектов рендерится
     if (this.lowSpec) {
-      const fog = this.scene.fog as THREE.Fog;
-      fog.near = Math.min(fog.near, 35);
-      fog.far = Math.min(fog.far, 140);
+      this.world.root.traverse((c) => {
+        const m = c as THREE.Mesh;
+        if (!m.isMesh) return;
+        m.castShadow = false;
+        m.receiveShadow = false;
+      });
     }
 
-    // антиалиасинг нельзя переключить в runtime, но PixelRatio остаётся максимальным
+    this.particles.lowSpec = this.lowSpec;
+    this.streaks.disabled = this.lowSpec;
+    this.world.genAhead = this.lowSpec ? 145 : GEN_AHEAD;
+    this.camera.far = this.lowSpec ? 165 : 275;
+    this.camera.updateProjectionMatrix();
+
     this.setTargets(LOCS[this.curLoc]);
     this.onResize();
+    if (this.paused) this.needPausedRender = true;
   }
 
   /** Действие с экранных кнопок */
   doAction(a: InputAction) { this.onAction(a); }
 
   dispose() {
+    this.clearPendingTimers();
     cancelAnimationFrame(this.raf);
     window.removeEventListener('resize', this.onResize);
     this.input.dispose();
     this.sfx.stopMusic();
-    this.composer.dispose();
     this.renderer.dispose();
     if (this.renderer.domElement.parentElement === this.mount) {
       this.mount.removeChild(this.renderer.domElement);
@@ -326,33 +324,35 @@ export class Game {
     if (this.state !== 'play' || this.paused) return;
     if (a === 'left' || a === 'right') {
       const dir = a === 'left' ? -1 : 1;
-      // проверяем: нет ли препятствия/поезда вплотную сбоку?
+      const targetLane = this.player.lane + dir;
+      if (targetLane < 0 || targetLane > 2) return;
+      const targetX = this.player.laneX(targetLane);
+
       let blocked = false;
-      if (this.state === 'play') {
-        const pb = this.player.bounds();
-        for (const c of this.world.colliders) {
-          const dzc = c.z - this.pz;
-          if (Math.abs(dzc) > c.half + 0.5) continue;
-          // объект сбоку в нужном направлении
-          const sideGap = Math.abs(c.x - pb.x) - c.w / 2 - 0.34;
-          if (sideGap < 1.2 && sideGap > -0.3 && Math.sign(c.x - pb.x) === dir) {
-            // перекрытие по Y — действительно на нашей высоте
-            if (c.y1 > pb.y0 + 0.1 && c.y0 < pb.y1 - 0.1) {
-              // едем на крыше — не блокировать
-              if (c.rideable && c.top !== undefined && pb.y0 >= (c.top ?? 0) - 0.55) continue;
-              // ОТСКОК от борта — звёздочки, но не переходим на ту дорожку
-              blocked = true;
-              this.graze(c.x, pb);
-              this.sfx.bump();
-              this.shake = Math.max(this.shake, 0.5);
-              this.particles.spawn(
-                (c.x + pb.x) / 2, this.player.feetY() + 0.8, this.pz,
-                LOCS[this.curLoc].accent2, 12, 2.4, 1.8, 0.5
-              );
-              break;
-            }
-          }
-        }
+      const pb = this.player.bounds();
+      const onCeiling = this.player.flipT > 0.5;
+      for (const c of this.world.colliders) {
+        const cz = c.z + (c.zOff ?? 0);
+        const dzc = cz - this.pz;
+        if (Math.abs(dzc) > c.half + 0.35) continue;
+        // Проверяем только те объекты, которые перекрывают целевую дорожку или зазор между текущей и целевой
+        const minX = Math.min(pb.x, targetX) - 0.34;
+        const maxX = Math.max(pb.x, targetX) + 0.34;
+        if (c.x + c.w / 2 < minX || c.x - c.w / 2 > maxX) continue;
+        if (onCeiling && c.y1 < 3.2) continue;
+        if (!onCeiling && c.y0 > 3.2) continue;
+        if (c.y1 <= pb.y0 + 0.1 || c.y0 >= pb.y1 - 0.1) continue;
+        if (c.rideable && c.top !== undefined && pb.y0 >= c.top - 0.55) continue;
+
+        blocked = true;
+        if (this.invulnT <= 0) this.graze(c.x, pb);
+        else this.sfx.bump();
+        this.shake = Math.max(this.shake, 0.5);
+        this.particles.spawn(
+          (c.x + pb.x) / 2, this.player.feetY() + 0.8, this.pz,
+          LOCS[this.curLoc].accent2, 10, 2.4, 1.8, 0.5
+        );
+        break;
       }
       if (!blocked && this.player.tryLane(dir)) {
         this.sfx.laneTick();
@@ -368,13 +368,11 @@ export class Game {
         this.particles.spawn(this.player.x, 0.1, this.pz, 0xffe9a8, 6, 2, 1.4, 0.4);
       }
     } else if (a === 'up') {
-      // ПРЫЖОК — работает везде, им же запрыгиваем на поезда
       if (this.player.jump()) {
         this.sfx.jumpS();
         this.particles.spawn(this.player.x, this.player.feetY() + 0.1, this.pz, 0xffe9a8, 8, 2.2, 1.6, 0.45);
       }
     } else if (a === 'down') {
-      // КУВЫРОК — проехать под барьером
       if (this.player.roll()) {
         this.sfx.whoosh();
         const fy = this.player.feetY();
@@ -387,9 +385,31 @@ export class Game {
 
   // ─────────────────────────── цикл ───────────────────────────
   private tick(now: number) {
-    let dt = Math.min((now - this.last) / 1000, 0.05);
+    const rawDt = Math.min((now - this.last) / 1000, 0.05);
     this.last = now;
-    if (this.paused) { this.composer.render(); return; }
+    if (this.paused) {
+      if (this.needPausedRender) {
+        this.needPausedRender = false;
+        this.renderer.render(this.scene, this.camera);
+      }
+      return;
+    }
+
+    // Авто-оптимизация при стабильных просадках FPS (если пользователь не выбрал режим вручную)
+    if (!this.lowSpec && !this.manualPerfOverride && this.state === 'play') {
+      if (rawDt > 0.036) {
+        this.slowFrames++;
+        if (this.slowFrames > 30) {
+          this.lowSpec = true;
+          this.applyPerfProfile();
+          this.cb.perfMode?.(true);
+        }
+      } else {
+        this.slowFrames = Math.max(0, this.slowFrames - 1);
+      }
+    }
+
+    let dt = rawDt;
     this.t += dt;
     const t = this.t;
 
@@ -407,7 +427,6 @@ export class Game {
     if (playing) {
       if (this.state === 'play') {
         this.elapsed += dt;
-        // окно «на грани» после лёгкого задевания
         if (this.invulnT > 0) this.invulnT = Math.max(0, this.invulnT - dt);
         if (this.grazeWindow > 0) {
           this.grazeWindow = Math.max(0, this.grazeWindow - dt);
@@ -418,7 +437,7 @@ export class Game {
           }
         }
         this.world.diff = diff;
-        this.speed = Math.min(38, 15 + this.elapsed * 0.14 + this.dist * 0.0012);
+        this.speed = Math.min(38, 19 + this.elapsed * 0.14 + this.dist * 0.0012);
         this.dist += this.speed * dt;
         this.pz -= this.speed * dt;
       }
@@ -442,9 +461,9 @@ export class Game {
       // встречные поезда / драконы
       this.oncT -= dt;
       if (this.oncT <= 0) {
-        const kind = this.world.spawnOncoming(this.pz - 280, this.speed, this.curLoc);
+        const kind = this.world.spawnOncoming(this.pz - 280, this.speed);
         if (kind === 'train') { this.sfx.horn(); this.cb.warn('train'); }
-        else { this.sfx.roar(); this.cb.warn('dragon'); }
+        else if (kind === 'dragon') { this.sfx.roar(); this.cb.warn('dragon'); }
         this.oncT = rand(5.0, 8.0) - diff * 2.2;
       }
 
@@ -468,7 +487,6 @@ export class Game {
       for (const ev of this.world.pollEvents(this.pz)) {
         if (ev.type === 'loc' && ev.loc) {
           this.curLoc = ev.loc;
-          // стая мопсов бежит рядом только на их улице
           this.world.setPugPack(ev.loc === 'pugs');
           this.world.setBossDragon(ev.loc === 'castle');
           if (ev.loc !== 'castle') this.world.clearFire();
@@ -481,6 +499,7 @@ export class Game {
           this.setTargets(cfg);
         } else if (ev.type === 'preCastle') {
           this.player.setLaneSet('castle');
+          this.player.forceLand();
           this.cb.banner('ШИПЫ И ЛЕСТНИЦА!', 'Главные дорожки закрыты — поднимайся на красную лестницу', '#ffb300');
           this.sfx.milestone();
         } else if (ev.type === 'mode' && ev.mode === 'jump') {
@@ -489,7 +508,9 @@ export class Game {
         } else if (ev.type === 'exitCastle') {
           this.player.setLaneSet('std');
           this.player.setMode('flip');
-          setTimeout(() => {
+          this.clearPendingTimers();
+          this.exitCastleTimer = window.setTimeout(() => {
+            this.exitCastleTimer = null;
             if (this.state === 'play') {
               this.cb.banner('ПОТОЛОК СНОВА ДОСТУПЕН', 'Улица замка заканчивается — назад, на основную дорогу', '#ffffff');
             }
@@ -500,77 +521,61 @@ export class Game {
       // столкновения + поиск опоры (крыши поездов)
       if (this.state === 'play') {
         const pb = this.player.bounds();
+        const onCeiling = this.player.flipT > 0.5;
         let support = 0;
+
         for (const c of this.world.colliders) {
-          const dzc = c.z - this.pz;
+          const cz = c.z + (c.zOff ?? 0);
+          const dzc = cz - this.pz;
           const overZ = dzc >= -c.half - 0.35 && dzc <= c.half + 0.35;
           const overX = Math.abs(c.x - pb.x) <= c.w / 2 + 0.34;
-          // падаем с потолка сальтом — крыша ловит нас заранее
           const dropping = this.player.droppingToFloor;
           const tol = dropping ? 99 : 0.55;
-          // крыша поезда как платформа
+
           if (c.rideable && c.top !== undefined && overX && overZ) {
             if (dropping || pb.y0 >= c.top - tol) support = Math.max(support, c.top);
           }
           if (!overZ || !overX) continue;
           if (c.y1 <= pb.y0 + 0.05 || c.y0 >= pb.y1 - 0.05) continue;
-          // едем по крыше или приземляемся на неё — это не столкновение
           if (c.rideable && c.top !== undefined && (dropping || pb.y0 >= c.top - tol)) continue;
-          
-          // РАЗДЕЛЕНИЕ ПРЕПЯТСТВИЙ:
-          // Если мы на потолке (flipT > 0.5), то препятствия у пола (c.y1 < 3.2) нас не трогают.
-          // Если мы на полу (flipT < 0.5), то препятствия у потолка (c.y0 > 3.2) нас не трогают.
-          const onCeiling = this.player.flipT > 0.5;
-          if (onCeiling && c.y1 < 3.2) continue; // летим над ними
-          if (!onCeiling && c.y0 > 3.2) continue; // бежим под ними
-          
-          // перепрыгнули: если ноги игрока выше верха препятствия — пропускаем
+
+          if (onCeiling && c.y1 < 3.2) continue;
+          if (!onCeiling && c.y0 > 3.2) continue;
           if (pb.y0 > c.y1 - 0.12 && !onCeiling) continue;
           if (this.invulnT > 0) continue;
 
-          // ── определяем тип удара: боковой или лобовой ──
           const ovX = (c.w / 2 + 0.34) - Math.abs(c.x - pb.x);
           const ovZ = (c.half + 0.35) - Math.abs(dzc);
-          // боковой удар: X-перекрытие мало, Z-перекрытие велико → врезались боком
           const sideHit = ovX < 0.65 && ovZ > 0.5;
           const headOn = (c.vz ?? 0) > 11;
 
-          // ── ВЫТОЛКНУТЬ из объекта (никогда не заходим внутрь) ──
-          const pushDir = Math.sign(pb.x - c.x);
+          const pushDir = (pb.x === c.x ? (c.x >= 0 ? -1 : 1) : Math.sign(pb.x - c.x)) as -1 | 1;
           const pushDist = ovX + 0.08;
           this.player.x += pushDir * pushDist;
           this.player.group.position.x = this.player.x;
 
           if (sideHit && !headOn) {
-            // БОКОВОЙ УДАР — всегда только звёздочки, откинуть назад на дорожку
             this.graze(c.x, pb);
-            // вернуть игрока на прошлую дорожку
-            const lanes = this.player.laneSet === 'castle'
-              ? [this.player.targetX() - 2.3, this.player.targetX(), this.player.targetX() + 2.3]
-              : undefined;
-            void lanes;
-            this.player.tryLane(-pushDir as -1 | 1); // отскочить обратно
+            this.player.bounceToSide(pushDir);
           } else if (!headOn && ovX < 0.4) {
-            // лёгкий лобовой — задевание
             this.graze(c.x, pb);
           } else {
-            // ФАТАЛЬНЫЙ лобовой удар
             this.crash(pushDir);
           }
           break;
         }
+
         // ── попадание огненного шара ──
         for (const f of this.world.fireballs) {
           const dzf = f.z - this.pz;
-          if (Math.abs(dzf) > 1.0) continue;
-          if (Math.abs(f.x - pb.x) > 0.95) continue;
-          if (f.y < pb.y0 - 0.85 || f.y > pb.y1 + 0.85) continue;
+          if (Math.abs(dzf) > 0.85) continue;
+          if (Math.abs(f.x - pb.x) > 0.72) continue;
+          if (f.y < pb.y0 - 0.55 || f.y > pb.y1 + 0.55) continue;
           if (this.invulnT > 0) continue;
           this.sfx.burn();
           this.particles.spawn(f.x, f.y, f.z, 0xff6b00, 20, 4, 3, 0.8);
           this.particles.spawn(f.x, f.y, f.z, 0xffd166, 12, 3.2, 3.5, 0.7);
           this.world.clearFire();
-          // огонь тоже щадит при первом касании
           if (this.grazeWindow > 0) this.crash(Math.sign(pb.x - f.x));
           else this.graze(f.x, pb);
           break;
@@ -584,6 +589,7 @@ export class Game {
           this.particles.spawn(this.player.x, this.player.baseY + 0.1, this.pz, LOCS[this.curLoc].accent2, 8, 2.4, 2.0, 0.5);
           this.cb.banner('НА КРЫШЕ ПОЕЗДА!', 'Держись — и уходи, пока состав не ушёл', css(LOCS[this.curLoc].accent2));
         }
+
         // монетки
         for (const cn of this.world.coins) {
           if (cn.taken) continue;
@@ -592,14 +598,12 @@ export class Game {
           if (Math.abs(cn.x - pb.x) > 0.8) continue;
           if (cn.y < pb.y0 - 0.95 || cn.y > pb.y1 + 0.95) continue;
           cn.taken = true;
-          cn.obj.visible = false;
           this.coinCount++;
           this.sfx.coin();
           this.particles.spawn(cn.x, cn.y, cn.z, 0xffd166, 7, 2.2, 2.4, 0.5);
         }
       }
 
-      // милы
       if (this.dist >= this.nextMile) {
         this.sfx.milestone();
         this.particles.spawn(this.player.x, 2, this.pz - 2, 0x22e0ff, 16, 4, 4, 0.9);
@@ -611,18 +615,15 @@ export class Game {
     }
 
     // мир и игрок обновляются всегда (в меню — фоновая сцена)
-    if (!this.paused) {
-      this.world.update(dt, this.pz, t, this.speed);
-      this.player.update(dt, this.state === 'menu' ? 2.5 : this.speed, t);
-      this.particles.update(dt);
-      this.streaks.update(dt, this.pz, this.state === 'play' ? this.speed : 0, TUNNEL_H);
-    }
+    this.world.update(dt, this.pz, t, this.speed);
+    this.player.update(dt, this.state === 'menu' ? 2.5 : this.speed, t);
+    this.particles.update(dt);
+    this.streaks.update(dt, this.pz, this.state === 'play' ? this.speed : 0, TUNNEL_H);
 
     // камера
     this.updateCamera(dt, t);
 
     // свет следует за игроком
-    this.point.position.set(this.player.x * 0.6, 4.4, this.pz - 4);
     const castle = this.curLoc === 'castle';
     const lx = castle ? -6.9 : 0;
     this.dir.position.set(lx + 9, 19, this.pz + 6);
@@ -630,9 +631,12 @@ export class Game {
       this.dir.target.position.set(lx, 0.5, this.pz - 12);
       this.dir.target.updateMatrixWorld();
     }
-    this.rim.position.set(lx - 11, 8, this.pz - 22);
-    this.heroLight.position.set(this.player.x, this.player.feetY() + 1.2, this.pz + 1.1);
-    this.heroLight.intensity = this.state === 'menu' ? 6 : 9;
+    if (!this.lowSpec) {
+      this.point.position.set(this.player.x * 0.6, 4.4, this.pz - 4);
+      this.rim.position.set(lx - 11, 8, this.pz - 22);
+      this.heroLight.position.set(this.player.x, this.player.feetY() + 1.2, this.pz + 1.1);
+      this.heroLight.intensity = this.state === 'menu' ? 6 : 8;
+    }
 
     // плавная смена палитры
     const k = Math.min(1, dt * 2.2);
@@ -660,7 +664,6 @@ export class Game {
       }
     }
 
-    // смерть → экран поражения
     if (this.state === 'dying' && this.dieTimer > 1.2) {
       this.state = 'dead';
       const score = Math.floor(this.dist) + this.coinCount * 25;
@@ -673,13 +676,12 @@ export class Game {
       this.cb.state('dead');
     }
 
-    this.composer.render();
+    this.renderer.render(this.scene, this.camera);
   }
 
   /** Лёгкое задевание: тряска, звёздочки и 20 секунд «на грани» */
   private graze(cx: number, pb: { x: number; y0: number; y1: number }) {
     if (this.grazeWindow > 0) {
-      // второй раз за 20 секунд — насмерть, отскок в сторону от препятствия
       const bounceDir = Math.sign(pb.x - cx);
       this.crash(bounceDir);
       return;
@@ -689,7 +691,7 @@ export class Game {
     this.player.stun(2.4);
     this.sfx.bump();
     this.shake = Math.max(this.shake, 0.85);
-    this.speed = Math.max(11, this.speed * 0.72);
+    this.speed = Math.max(12, this.speed * 0.72);
     const hy = (pb.y0 + pb.y1) / 2;
     this.particles.spawn((cx + pb.x) / 2, hy, this.pz, 0xffd93b, 14, 3.2, 2.6, 0.6);
     this.particles.spawn((cx + pb.x) / 2, hy, this.pz, 0xffffff, 8, 2.6, 2.2, 0.5);
@@ -722,17 +724,16 @@ export class Game {
     const px = this.player.x;
     const flip = this.player.flipT;
     const castle = this.curLoc === 'castle';
-    
-    // Камера следует за персонажем. При flip=1 (потолок) высота меняется на 14.
+
     const baseCamY = flip > 0.5 ? TUNNEL_H - 3.5 : 3.5;
     const targY = (castle ? 4.2 : baseCamY) + (this.player.baseY * 0.6);
-    
+
     const k = 1 - Math.pow(0.0001, dt);
     cam.position.x += (px * 0.6 - cam.position.x) * k;
     cam.position.y += (targY - cam.position.y) * k;
-    
+
     const pz = this.state === 'play' ? this.pz : this.player.group.position.z;
-    cam.position.z = pz + 9.5; // Чуть дальше для обзора
+    cam.position.z = pz + 9.5;
 
     this.shake = Math.max(0, this.shake - dt * 2.0);
     if (this.shake > 0.01) {
@@ -740,10 +741,8 @@ export class Game {
       cam.position.y += (Math.random() - 0.5) * this.shake * 0.3;
     }
 
-    // Полный поворот камеры на 180 (более агрессивный)
     const targetRotZ = flip * Math.PI;
     this.camRotZ += (targetRotZ - this.camRotZ) * Math.min(1, dt * 8);
-    cam.rotation.z = this.camRotZ;
 
     const lookY = flip > 0.5 ? TUNNEL_H - 1.8 : 1.8;
     cam.lookAt(px * 0.8, lookY + this.player.baseY * 0.5, pz - 12);
@@ -760,8 +759,8 @@ export class Game {
   private setTargets(cfg: (typeof LOCS)[LocId]) {
     this.tgt.bg.setHex(cfg.bg);
     this.tgt.fog.setHex(cfg.fog);
-    this.tgt.fogNear = cfg.fogNear;
-    this.tgt.fogFar = cfg.fogFar;
+    this.tgt.fogNear = this.lowSpec ? Math.min(cfg.fogNear, 35) : cfg.fogNear;
+    this.tgt.fogFar = this.lowSpec ? Math.min(cfg.fogFar, 138) : cfg.fogFar;
     this.tgt.hemiSky.setHex(cfg.hemiSky);
     this.tgt.hemiGround.setHex(cfg.hemiGround);
     this.tgt.sun.setHex(cfg.sunColor);
@@ -769,15 +768,11 @@ export class Game {
     this.dir.intensity += (cfg.sunInt - this.dir.intensity) * 0.5;
     this.point.color.setHex(cfg.accent2);
     this.rim.color.setHex(cfg.accent2);
-    // светло, но контрастно: без пересвета, чтобы всё было чётко видно
-    const mul = this.lowSpec ? 0.7 : 1;
-    this.bloom.strength = 0.14 * mul;
-    this.bloom.threshold = 0.9;
     this.renderer.toneMappingExposure = 0.94;
     this.ambient.intensity = 0.3;
     this.ambient.color.setHex(cfg.hemiSky);
-    this.point.intensity = 3;
-    this.rim.intensity = 0.4;
+    this.point.intensity = this.lowSpec ? 0 : 3;
+    this.rim.intensity = this.lowSpec ? 0 : 0.4;
   }
 
   private snapColors(cfg: (typeof LOCS)[LocId]) {
@@ -785,7 +780,7 @@ export class Game {
     (this.scene.background as THREE.Color).copy(this.tgt.bg);
     const fog = this.scene.fog as THREE.Fog;
     fog.color.copy(this.tgt.fog);
-    fog.near = cfg.fogNear; fog.far = cfg.fogFar;
+    fog.near = this.tgt.fogNear; fog.far = this.tgt.fogFar;
     this.hemi.color.copy(this.tgt.hemiSky);
     this.hemi.groundColor.copy(this.tgt.hemiGround);
     this.hemi.intensity = cfg.hemiInt;
@@ -794,11 +789,10 @@ export class Game {
   }
 
   private onResize = () => {
-    const w = this.mount.clientWidth, h = this.mount.clientHeight;
+    const w = Math.max(1, this.mount.clientWidth), h = Math.max(1, this.mount.clientHeight);
     this.renderer.setSize(w, h);
-    this.composer.setSize(w, h);
-    this.bloom.setSize(w, h);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    if (this.paused) this.needPausedRender = true;
   };
 }

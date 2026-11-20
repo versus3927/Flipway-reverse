@@ -6,12 +6,13 @@ function cnv(w: number, h: number) {
   return [c, c.getContext('2d')!] as const;
 }
 
-function toTex(c: HTMLCanvasElement) {
+function toTex(c: HTMLCanvasElement, repX = 1, repY = 1) {
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
   t.wrapS = THREE.RepeatWrapping;
   t.wrapT = THREE.RepeatWrapping;
-  t.anisotropy = 4;
+  if (repX !== 1 || repY !== 1) t.repeat.set(repX, repY);
+  t.anisotropy = 2;
   return t;
 }
 
@@ -35,29 +36,32 @@ export function glowTex(): THREE.Texture {
 }
 
 /** Тёмная панель со светящимися окнами */
-export function windowsTex(base: string, lit: string, cols = 5, rows = 7): THREE.Texture {
-  const key = `win${base}${lit}${cols}${rows}`;
+export function windowsTex(base: string, lit: string, cols = 5, rows = 7, repX = 1, repY = 1): THREE.Texture {
+  const key = `win${base}|${lit}|${cols}|${rows}|${repX}|${repY}`;
   let t = cache.get(key);
   if (t) return t;
   const [c, g] = cnv(128, 160);
   g.fillStyle = base;
   g.fillRect(0, 0, 128, 160);
   const cw = 128 / cols, rh = 160 / rows;
+  // Детерминированный рисунок окон вместо Math.random — стабильно и кэшируемо
   for (let y = 0; y < rows; y++) {
     for (let x = 0; x < cols; x++) {
-      const on = Math.random() < 0.55;
+      const hash = ((x * 73856093) ^ (y * 19349663) ^ cols) & 255;
+      const on = hash < 145;
       g.fillStyle = on ? lit : 'rgba(0,0,0,0.35)';
       g.fillRect(x * cw + cw * 0.24, y * rh + rh * 0.26, cw * 0.52, rh * 0.46);
     }
   }
-  t = toTex(c);
+  t = toTex(c, repX, repY);
   cache.set(key, t);
   return t;
 }
 
 /** Диагональная предупреждающая разметка */
-export function hazardTex(): THREE.Texture {
-  let t = cache.get('haz');
+export function hazardTex(repX = 1, repY = 1): THREE.Texture {
+  const key = `haz|${repX}|${repY}`;
+  let t = cache.get(key);
   if (t) return t;
   const [c, g] = cnv(128, 128);
   g.fillStyle = '#15161c';
@@ -68,8 +72,8 @@ export function hazardTex(): THREE.Texture {
     g.moveTo(i, 128); g.lineTo(i + 22, 128); g.lineTo(i + 128 + 22, 0); g.lineTo(i + 128, 0);
     g.closePath(); g.fill();
   }
-  t = toTex(c);
-  cache.set('haz', t);
+  t = toTex(c, repX, repY);
+  cache.set(key, t);
   return t;
 }
 
@@ -88,8 +92,8 @@ export function stripesTex(a: string, b: string): THREE.Texture {
 }
 
 /** Булыжная мостовая */
-export function cobbleTex(base = '#a89f8c', gap = '#7d7462'): THREE.Texture {
-  const key = `cob${base}${gap}`;
+export function cobbleTex(base = '#a89f8c', gap = '#7d7462', repX = 1, repY = 1): THREE.Texture {
+  const key = `cob${base}|${gap}|${repX}|${repY}`;
   let t = cache.get(key);
   if (t) return t;
   const [c, g] = cnv(128, 128);
@@ -98,14 +102,15 @@ export function cobbleTex(base = '#a89f8c', gap = '#7d7462'): THREE.Texture {
   for (let y = 0; y < 5; y++) {
     for (let x = 0; x < 5; x++) {
       const off = y % 2 ? s / 2 : 0;
-      const l = 0.86 + Math.random() * 0.22;
+      const hash = ((x * 37 + y * 91) % 23) / 100;
+      const l = 0.86 + hash;
       g.fillStyle = shadeHex(base, l);
       const px = ((x * s + off) % 140) - 6;
       roundRect(g, px + 2, y * s + 2, s - 4, s - 4, 6);
       g.fill();
     }
   }
-  t = toTex(c);
+  t = toTex(c, repX, repY);
   cache.set(key, t);
   return t;
 }

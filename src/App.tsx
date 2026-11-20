@@ -26,7 +26,12 @@ export default function App() {
   const [loc, setLoc] = useState<LocId>('metro');
   const [paused, setPaused] = useState(false);
   const [muted, setMuted] = useState(() => localStorage.getItem('gr_mute') === '1');
-  const [lowSpec, setLowSpec] = useState(() => localStorage.getItem('gr_low') === '1');
+  const [lowSpec, setLowSpec] = useState(() => {
+    const saved = localStorage.getItem('gr_low');
+    if (saved === '1') return true;
+    if (saved === '0') return false;
+    return matchMedia('(pointer: coarse)').matches || (navigator.hardwareConcurrency ?? 4) <= 4;
+  });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [results, setResults] = useState<Results | null>(null);
   const [grazeT, setGrazeT] = useState(0);
@@ -42,10 +47,14 @@ export default function App() {
       over: (r) => setResults(r),
       pauseChange: (p) => setPaused(p),
       graze: (t) => setGrazeT(t),
+      perfMode: (low) => setLowSpec(low),
     });
     gameRef.current = game;
     game.setMuted(localStorage.getItem('gr_mute') === '1');
-    game.setOptimizationMode(localStorage.getItem('gr_low') === '1');
+    const savedLow = localStorage.getItem('gr_low');
+    if (savedLow === '1' || savedLow === '0') {
+      game.setOptimizationMode(savedLow === '1');
+    }
 
     const onVis = () => {
       if (document.hidden) {
@@ -110,11 +119,11 @@ export default function App() {
   const locCfg = LOCS[loc];
 
   return (
-    <div className="relative h-full w-full overflow-hidden bg-[#04060d]">
+    <div className={`relative h-full w-full overflow-hidden bg-[#04060d] ${lowSpec ? 'low-spec' : ''}`}>
       <div ref={mountRef} className="absolute inset-0" />
 
       <div className="pointer-events-none absolute inset-0 vignette" />
-      <div className="pointer-events-none absolute inset-0 scanlines opacity-30" />
+      {!lowSpec && <div className="pointer-events-none absolute inset-0 scanlines opacity-30" />}
       {grazeT > 0 && state === 'play' && (
         <div
           className="pointer-events-none absolute inset-0 animate-warn"
@@ -163,7 +172,7 @@ export default function App() {
                   <Smartphone size={18} className="text-amber-200" />
                   <div>
                     <div className="font-display text-sm" style={{ fontWeight: 700 }}>Оптимизация для слабых телефонов</div>
-                    <div className="font-russo text-[11px] text-white/60">Ниже разрешение, без теней, легче графика</div>
+                    <div className="font-russo text-[11px] text-white/60">Без теней, меньше частиц и эффектов</div>
                   </div>
                 </div>
                 <div className={`rounded-full px-3 py-1 text-[11px] font-russo ${lowSpec ? 'bg-amber-400/20 text-amber-100' : 'bg-white/10 text-white/60'}`}>
