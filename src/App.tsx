@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Game, HudData } from './game/Game';
-import { LOCS, LocId, css } from './game/config';
+import { LOCS, LocId, css, detectLowSpecDefault } from './game/config';
 import {
   Play, RotateCcw, Pause, Volume2, VolumeX, Coins, Gauge, Trophy,
   TrainFront, AlertTriangle, Building2,
@@ -26,12 +26,7 @@ export default function App() {
   const [loc, setLoc] = useState<LocId>('metro');
   const [paused, setPaused] = useState(false);
   const [muted, setMuted] = useState(() => localStorage.getItem('gr_mute') === '1');
-  const [lowSpec, setLowSpec] = useState(() => {
-    const saved = localStorage.getItem('gr_low');
-    if (saved === '1') return true;
-    if (saved === '0') return false;
-    return matchMedia('(pointer: coarse)').matches || (navigator.hardwareConcurrency ?? 4) <= 4;
-  });
+  const [lowSpec, setLowSpec] = useState(() => detectLowSpecDefault());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [results, setResults] = useState<Results | null>(null);
   const [grazeT, setGrazeT] = useState(0);

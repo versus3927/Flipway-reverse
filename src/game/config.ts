@@ -6,9 +6,23 @@ export const CASTLE_SHIFT = -6.9;
 export const CASTLE_LANES = LANES.map((x) => x + CASTLE_SHIFT);
 export const TUNNEL_H = 14.0; // Огромное пространство между мирами
 export const CHUNK = 30; // длина чанка
-export const GEN_AHEAD = 240; // как далеко вперёд генерировать
+export const GEN_AHEAD = 275; // как далеко вперёд генерировать (всегда дальше тумана и camera.far)
 export const PLAYER_H = 1.5;
 export const CAM_LERP = 0.08; // скорость следования камеры
+
+export function detectLowSpecDefault(): boolean {
+  if (typeof window === 'undefined') return true;
+  try {
+    const saved = localStorage.getItem('gr_low');
+    if (saved === '1') return true;
+    if (saved === '0') return false;
+  } catch { /* ignore */ }
+  const coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+  const touch = (navigator.maxTouchPoints ?? 0) > 0;
+  const mobileUA = /Android|iPhone|iPad|iPod|Mobile|Capacitor|wv/i.test(navigator.userAgent || '');
+  const cores = navigator.hardwareConcurrency ?? 4;
+  return coarse || touch || mobileUA || cores <= 4;
+}
 
 export type LocId = 'metro' | 'canyon' | 'ice' | 'pugs' | 'castle' | 'sunny';
 export type MoveMode = 'flip' | 'jump';

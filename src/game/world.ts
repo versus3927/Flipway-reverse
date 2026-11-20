@@ -53,6 +53,7 @@ export class World {
   diff = 0;
   genAhead = GEN_AHEAD;
   shadows = false;
+  lowSpec = false;
 
   private chunks: Chunk[] = [];
   private extras: Extra[] = [];
@@ -77,11 +78,103 @@ export class World {
   private bag: LocId[] = [];
   private palaceIdx = 0;
   private safeChunks = 2;
+  private prewarmIdx = 0;
+  private prewarmedLow: boolean | null = null;
 
   constructor(private scene: THREE.Scene) {
     scene.add(this.root);
     this.initCoinsMesh();
+    this.prewarmGrounds();
     this.reset();
+  }
+
+  private prewarmGrounds() {
+    const tmp = new THREE.Group();
+    for (const loc of LOC_LIST) this.buildGround(tmp, loc);
+  }
+
+  /** Прогревает 1 биом за вызов (префабы + текстуры), чтобы при смене локации не было фризов и пропадания земли */
+  prewarmStep(): boolean {
+    if (this.prewarmedLow !== this.lowSpec) {
+      this.prewarmIdx = 0;
+      this.prewarmedLow = this.lowSpec;
+    }
+    if (this.prewarmIdx >= LOC_LIST.length) return false;
+    const loc = LOC_LIST[this.prewarmIdx++];
+    const fx = !this.lowSpec;
+    const cfg = LOCS[loc];
+    MX.getCoinMeshData();
+    MX.makeGate(
+      loc === 'castle' ? CASTLE_LANES[0] - 1.4 : -5.4,
+      loc === 'castle' ? CASTLE_LANES[2] + 1.4 : 5.4,
+      cfg.accent,
+      fx
+    );
+    for (const len of [10, 12, 13, 15, 16]) {
+      MX.makeTrain(len, TRAIN_SCHEMES[loc], fx);
+    }
+    if (loc === 'castle') {
+      MX.makePalace('keep'); MX.makePalace('tower'); MX.makePalace('wall');
+      MX.makeRailingRow(CHUNK);
+      MX.makeCastleStairway();
+      MX.makeSpikeField(6.4, 20);
+      MX.makeBarricade(7.9);
+      MX.makeArrow('left', LOCS.castle.accent);
+      MX.makeArrow('right', 0xffffff);
+      MX.makeTree(); MX.makeBush(); MX.makeVase(); MX.makeRailOb();
+      for (let v = 0; v < 4; v++) MX.makeCloud(v);
+      for (const c of [0x57a04a, 0x8a5bd6, 0xc63b2f, 0x3d6ea8]) MX.makeDragon(c, 1);
+      MX.makeFireball(); MX.makeFireWarn();
+    } else {
+      MX.makeCeilObstacle(loc);
+      MX.makeRollBar(loc, false);
+      MX.makeRollBar(loc, true);
+      MX.makeBlock(loc);
+      for (let v = 0; v < (loc === 'sunny' ? 2 : 1); v++) MX.makeFloorObstacle(loc, v);
+      if (loc === 'metro') {
+        for (let v = 0; v < 4; v++) { MX.makeBuilding(-1, cfg.accent, v); MX.makeBuilding(1, cfg.accent, v); }
+        MX.makePillar(cfg.accent2);
+        MX.makeSkylight(CHUNK, fx);
+        MX.makeCeilLight(0xfff6e0);
+      } else if (loc === 'canyon') {
+        for (let v = 0; v < 4; v++) MX.makeRockWall(v);
+        for (let v = 0; v < 3; v++) MX.makeHoodoo(v);
+        MX.makeCactus();
+      } else if (loc === 'ice') {
+        for (let v = 0; v < 3; v++) { MX.makeCrystalCluster(fx, v); MX.makeIcicle(v); }
+      } else if (loc === 'pugs') {
+        for (let v = 0; v < 4; v++) { MX.makeStorefront(-1, cfg.accent, v); MX.makeStorefront(1, cfg.accent, v); }
+        MX.makeLantern(fx); MX.makeBunting(); MX.makePug();
+      } else if (loc === 'sunny') {
+        for (let v = 0; v < 4; v++) { MX.makeSunnyBuilding(-1, v); MX.makeSunnyBuilding(1, v); }
+        MX.makeGlassRoof(CHUNK, fx);
+        MX.makePalm(); MX.makeStreetLamp(fx); MX.makeBench(); MX.makeFountain(fx);
+      }
+    }
+    return this.prewarmIdx < LOC_LIST.length;
+  }
+
+  prewarmAll() {
+    while (this.prewarmStep()) { /* прогрев всех биомов */ }
+  }
+
+  setLowSpec(low: boolean) {
+    this.lowSpec = low;
+    this.shadows = !low;
+    this.genAhead = low ? 175 : GEN_AHEAD;
+    if (low) {
+      this.root.traverse((o) => {
+        if (o.userData.fxOnly) o.visible = false;
+      });
+    }
+    if (this.packOn) {
+      this.setPugPack(false);
+      this.setPugPack(true);
+    }
+  }
+
+  ensureAhead(pz: number) {
+    while (this.genZ > pz - this.genAhead) this.genChunk();
   }
 
   private initCoinsMesh() {
@@ -128,17 +221,17 @@ export class World {
     this.updateFireballs(dt, pz, t);
     this.updateBoss(dt, pz, t);
     // генерация вперёд
-    while (this.genZ > pz - this.genAhead) this.genChunk();
-    // переработка чанков
+    this.ensureAhead(pz);
+    // переработка чанков (строго за спиной камеры, чтобы земля никогда не исчезала)
     for (let i = this.chunks.length - 1; i >= 0; i--) {
       const c = this.chunks[i];
-      if (c.z0 > pz + 30) {
+      if (c.z0 > pz + 45) {
         this.root.remove(c.node);
         this.chunks.splice(i, 1);
       }
     }
     for (let i = this.extras.length - 1; i >= 0; i--) {
-      if (this.extras[i].z0 > pz + 40) {
+      if (this.extras[i].z0 > pz + 60) {
         this.root.remove(this.extras[i].obj);
         this.extras.splice(i, 1);
       }
@@ -216,12 +309,13 @@ export class World {
       this.pugPack = [];
       return;
     }
-    const slots = [
+    const allSlots = [
       { lane: 0, off: -3.5, side: 0 }, { lane: 2, off: -2.2, side: 0 },
       { lane: 0, off: 4.5, side: 0 }, { lane: 2, off: 5.2, side: 0 },
       { lane: 1, off: 7.0, side: 0 }, { lane: 1, off: -6.0, side: 0 },
       { lane: 0, off: 0.5, side: -1 }, { lane: 2, off: 1.2, side: 1 },
     ];
+    const slots = this.lowSpec ? allSlots.slice(0, 4) : allSlots;
     for (const s of slots) {
       const pug = MX.makePug();
       pug.scale.setScalar(rand(0.72, 1.0));
@@ -348,7 +442,11 @@ export class World {
   /** Перебазировка координат, чтобы не уплыть по точности float */
   shift(dz: number) {
     this.genZ += dz;
-    for (const c of this.chunks) { c.z0 += dz; c.node.position.z += dz; }
+    for (const c of this.chunks) {
+      c.z0 += dz;
+      c.node.position.z += dz;
+      c.node.updateMatrix();
+    }
     for (const e of this.extras) { e.z0 += dz; e.obj.position.z += dz; }
     for (const a of this.animated) a.z0 += dz;
     for (const v of this.visMovers) v.obj.position.z += dz;
@@ -371,14 +469,34 @@ export class World {
     const z0 = this.genZ;
     const node = new THREE.Group();
     node.position.z = z0;
-    this.buildGround(node, loc);
-    this.buildDecor(node, loc, z0);
+
+    // Вся статическая геометрия чанка (земля + декор + статические препятствия без теней)
+    // объединяется в 1–4 draw-call'а, резко снижая нагрузку на мобильный GPU.
+    const staticGrp = new THREE.Group();
+    this.buildGround(staticGrp, loc);
+    this.buildDecor(staticGrp, node, loc, z0);
 
     // За 90м до замка очищаем тоннельные препятствия, чтобы игрок спокойно съехал по лестнице
     const preCastleClear = loc !== 'castle' && this.nextLoc === 'castle' && this.segLeft <= 90;
-    if (loc === 'castle') this.buildCastleHazards(node, z0);
-    else if (!preCastleClear) this.buildTunnelHazards(node, z0, loc);
+    const hazTarget = this.shadows ? node : staticGrp;
+    if (loc === 'castle') this.buildCastleHazards(hazTarget, z0);
+    else if (!preCastleClear) this.buildTunnelHazards(hazTarget, z0, loc);
 
+    const bakedStatic = MX.bakeGroup(staticGrp);
+    for (const ch of bakedStatic.children) {
+      const m = ch as THREE.Mesh;
+      if (m.isMesh) {
+        m.matrixAutoUpdate = false;
+        m.updateMatrix();
+        if (this.shadows) m.receiveShadow = true;
+      }
+    }
+    bakedStatic.matrixAutoUpdate = false;
+    bakedStatic.updateMatrix();
+    node.add(bakedStatic);
+
+    node.matrixAutoUpdate = false;
+    node.updateMatrix();
     this.root.add(node);
     this.chunks.push({ node, z0 });
     this.genZ -= CHUNK;
@@ -401,7 +519,8 @@ export class World {
     const gate = MX.makeGate(
       next === 'castle' ? CASTLE_LANES[0] - 1.4 : -5.4,
       next === 'castle' ? CASTLE_LANES[2] + 1.4 : 5.4,
-      cfg.accent
+      cfg.accent,
+      !this.lowSpec
     );
     gate.position.z = zB;
     this.root.add(gate);
@@ -418,7 +537,7 @@ export class World {
         sp.position.set(0.4, 0, zz);
         this.markShadow(sp);
         this.root.add(sp);
-        this.extras.push({ obj: sp, z0: zz });
+        this.extras.push({ obj: sp, z0: zz - 20 });
         this.colliders.push({ x: 0.4, z: zz - 10, w: 6.4, half: 10, y0: 0, y1: 1.2 });
       }
 
@@ -429,14 +548,14 @@ export class World {
         1.7, 3.75, zB - 37.5
       );
       this.root.add(wallBlock);
-      this.extras.push({ obj: wallBlock, z0: zB });
+      this.extras.push({ obj: wallBlock, z0: zB - 75 });
       this.colliders.push({ x: 1.7, z: zB - 37.5, w: 9.4, half: 37.5, y0: 0, y1: 7.5 });
 
       // ── КРАСНАЯ ЛЕСТНИЦА ──
       const stair = MX.makeCastleStairway();
       stair.position.set(0, 0, zB + 68);
       this.root.add(stair);
-      this.extras.push({ obj: stair, z0: zB + 68 });
+      this.extras.push({ obj: stair, z0: zB + 48 });
 
       for (const zz of [zB + 74, zB + 60, zB + 46]) {
         for (const lx of LANES) {
@@ -523,36 +642,38 @@ export class World {
     if (obj.userData.tick) this.animated.push({ obj, z0 });
   }
 
-  private buildDecor(node: THREE.Group, loc: LocId, z0: number) {
+  private buildDecor(staticGrp: THREE.Group, node: THREE.Group, loc: LocId, z0: number) {
     const cfg = LOCS[loc];
+    const fx = !this.lowSpec;
     switch (loc) {
       case 'metro': {
         for (const s of [-1, 1]) {
           const b = MX.makeBuilding(s, cfg.accent);
           b.position.set(s * 8.6, 0, -14);
-          node.add(b);
+          staticGrp.add(b);
           for (const zz of [-7.5, -22.5]) {
             const p = MX.makePillar(cfg.accent2);
             p.position.set(s * 5.7, 0, zz);
-            node.add(p);
+            staticGrp.add(p);
           }
         }
         for (const zz of [-7.5, -22.5]) {
           const beam = MX.M(MX.boxGeo(11.4, 0.32, 0.7), MX.std(0xe8edf3, 0, 0, 0.7), 0, TUNNEL_H - 0.18, zz);
-          node.add(beam);
+          staticGrp.add(beam);
         }
-        node.add(MX.makeSkylight(CHUNK));
-        for (let i = 0; i < 2; i++) {
+        staticGrp.add(MX.makeSkylight(CHUNK, fx));
+        if (fx) {
           const sh = MX.makeSunShaft();
-          sh.position.set(rand(-4, 4), sh.position.y, -rand(4, 26));
+          sh.position.set(rand(-3.5, 3.5), sh.position.y, -rand(6, 24));
+          sh.userData.fxOnly = true;
           node.add(sh);
         }
         const lt = MX.makeCeilLight(0xfff6e0);
         lt.position.set(0, TUNNEL_H - 0.45, -15);
-        node.add(lt);
+        staticGrp.add(lt);
         if (Math.random() < 0.16) {
           const s = Math.random() < 0.5 ? -1 : 1;
-          const tr = MX.makeTrain(16, TRAIN_SCHEMES.metro);
+          const tr = MX.makeTrain(16, TRAIN_SCHEMES.metro, fx);
           tr.position.set(s * 9.2, 0, z0 - 15);
           this.root.add(tr);
           this.visMovers.push({ obj: tr, vz: rand(26, 40) });
@@ -563,38 +684,38 @@ export class World {
         for (const s of [-1, 1]) {
           const r = MX.makeRockWall();
           r.position.set(s * rand(9.2, 10.4), 0, -15);
-          node.add(r);
+          staticGrp.add(r);
         }
         const side = pick([-1, 1]);
         const hd = MX.makeHoodoo();
         hd.position.set(side * 6.7, 0, -rand(6, 24));
-        node.add(hd);
+        staticGrp.add(hd);
         if (Math.random() < 0.4) {
           const c = MX.makeCactus();
           c.position.set(-side * 6.2, 0, -rand(4, 26));
-          node.add(c);
+          staticGrp.add(c);
         }
         for (let i = 0; i < 2; i++) {
           const rock = MX.M(MX.coneGeo(0.7, 1.7, 6), MX.std(0x6e3a1f, 0, 0, 1), pick([-1, 1]) * rand(3.6, 5.2), TUNNEL_H - 0.6, -rand(4, 26));
           rock.rotation.x = Math.PI;
-          node.add(rock);
+          staticGrp.add(rock);
         }
-        node.add(MX.M(MX.boxGeo(24, 1.2, CHUNK * 0.7), MX.std(0x5e3018, 0, 0, 1), 0, TUNNEL_H + 0.7, -CHUNK / 2));
+        staticGrp.add(MX.M(MX.boxGeo(24, 1.2, CHUNK * 0.7), MX.std(0x5e3018, 0, 0, 1), 0, TUNNEL_H + 0.7, -CHUNK / 2));
         break;
       }
       case 'ice': {
         for (const s of [-1, 1]) {
-          node.add(MX.M(MX.boxGeo(4, 8, 26), MX.std(0xc8e6f5, 0, 0, 0.6, 0.05), s * 9.4, 3.6, -14));
+          staticGrp.add(MX.M(MX.boxGeo(4, 8, 26), MX.std(0xc8e6f5, 0, 0, 0.6, 0.05), s * 9.4, 3.6, -14));
           for (const zz of [-9, -21]) {
-            const cr = MX.makeCrystalCluster();
+            const cr = MX.makeCrystalCluster(fx);
             cr.position.set(s * 5.9, 0, zz + rand(-2, 2));
-            node.add(cr);
+            staticGrp.add(cr);
           }
         }
         for (let i = 0; i < 3; i++) {
           const ic = MX.makeIcicle();
           ic.position.set(rand(-5, 5) > 0 ? rand(3.4, 5.2) : rand(-5.2, -3.4), TUNNEL_H - 0.5, -rand(3, 27));
-          node.add(ic);
+          staticGrp.add(ic);
         }
         break;
       }
@@ -602,11 +723,11 @@ export class World {
         for (const s of [-1, 1]) {
           const sf = MX.makeStorefront(s, cfg.accent);
           sf.position.set(s * 7.0, 0, -14);
-          node.add(sf);
+          staticGrp.add(sf);
         }
         for (const zz of [-7.5, -22.5]) {
           for (const lx of [-1.15, 1.15]) {
-            const ln = MX.makeLantern();
+            const ln = MX.makeLantern(fx);
             ln.position.set(lx, TUNNEL_H - 0.75, zz);
             node.add(ln);
             this.trackAnim(ln, z0);
@@ -614,7 +735,7 @@ export class World {
         }
         const bn = MX.makeBunting();
         bn.position.set(0, TUNNEL_H - 0.55, -15);
-        node.add(bn);
+        staticGrp.add(bn);
         if (Math.random() < 0.3) {
           const s = pick([-1, 1]);
           const p = MX.makePug();
@@ -629,12 +750,13 @@ export class World {
         for (const s of [-1, 1]) {
           const b = MX.makeSunnyBuilding(s);
           b.position.set(s * 7.2, 0, -14);
-          node.add(b);
+          staticGrp.add(b);
         }
-        node.add(MX.makeGlassRoof(CHUNK));
-        for (let i = 0; i < 2; i++) {
+        staticGrp.add(MX.makeGlassRoof(CHUNK, fx));
+        if (fx) {
           const sh = MX.makeSunShaft();
-          sh.position.set(rand(-4, 4), sh.position.y, -rand(3, 27));
+          sh.position.set(rand(-3.5, 3.5), sh.position.y, -rand(5, 25));
+          sh.userData.fxOnly = true;
           node.add(sh);
         }
         for (const s of [-1, 1]) {
@@ -642,57 +764,65 @@ export class World {
             const pl = MX.makePalm();
             pl.position.set(s * rand(4.3, 5.2), 0, -rand(3, 27));
             pl.scale.setScalar(rand(0.85, 1.15));
-            node.add(pl);
+            staticGrp.add(pl);
           }
-          const lp = MX.makeStreetLamp();
+          const lp = MX.makeStreetLamp(fx);
           lp.position.set(s * 4.7, 0, -rand(6, 24));
           lp.rotation.y = s > 0 ? Math.PI : 0;
-          node.add(lp);
+          staticGrp.add(lp);
           if (Math.random() < 0.5) {
             const bh = MX.makeBench();
             bh.position.set(s * 4.4, 0, -rand(4, 26));
             bh.rotation.y = s > 0 ? -Math.PI / 2 : Math.PI / 2;
-            node.add(bh);
+            staticGrp.add(bh);
           }
         }
         if (Math.random() < 0.28) {
-          const f = MX.makeFountain();
+          const f = MX.makeFountain(fx);
           f.position.set(pick([-1, 1]) * 5.4, 0, -rand(8, 22));
-          node.add(f);
-          this.trackAnim(f, z0);
+          if (fx) {
+            node.add(f);
+            this.trackAnim(f, z0);
+          } else {
+            staticGrp.add(f);
+          }
         }
         break;
       }
       case 'castle': {
         const wallR = MX.M(MX.boxGeo(15, 12, CHUNK + 2), MX.std(0xa09484, 0, 0, 0.95), 4.5, 5.5, -CHUNK / 2);
-        node.add(wallR);
+        staticGrp.add(wallR);
         for (let i = 0; i < Math.floor(CHUNK / 5); i++) {
-          node.add(MX.M(MX.boxGeo(1.2, 1.0, 1.4), MX.std(0xa09484, 0, 0, 0.95), -2.2, 12, -1.5 - i * 5));
+          staticGrp.add(MX.M(MX.boxGeo(1.2, 1.0, 1.4), MX.std(0xa09484, 0, 0, 0.95), -2.2, 12, -1.5 - i * 5));
         }
         const rail = MX.makeRailingRow(CHUNK);
         rail.position.set(-10.55, 0, 0);
-        node.add(rail);
-        const moat = MX.makeMoat(CHUNK);
+        staticGrp.add(rail);
+        const moat = MX.makeMoat(CHUNK, fx);
         moat.position.set(-14, 0, 0);
-        node.add(moat);
-        for (const ch of moat.children) this.trackAnim(ch, z0);
-        node.add(MX.M(MX.boxGeo(1.4, 0.8, CHUNK), MX.std(0x8a8271), -17.9, 0.4, -CHUNK / 2));
+        if (fx) {
+          node.add(moat);
+          for (const ch of moat.children) this.trackAnim(ch, z0);
+        } else {
+          staticGrp.add(moat);
+        }
+        staticGrp.add(MX.M(MX.boxGeo(1.4, 0.8, CHUNK), MX.std(0x8a8271), -17.9, 0.4, -CHUNK / 2));
         const variants: ('keep' | 'tower' | 'wall')[] = ['wall', 'keep', 'wall', 'tower'];
         const pv = variants[this.palaceIdx % variants.length];
         this.palaceIdx++;
         const pal = MX.makePalace(pv);
         pal.position.set(-22, 0, -CHUNK / 2);
-        node.add(pal);
+        staticGrp.add(pal);
         if (Math.random() < 0.5) {
           const tr = MX.makeTree();
           tr.position.set(rand(5.6, 9.6), 0, -rand(4, 26));
           tr.scale.setScalar(rand(0.8, 1.3));
-          node.add(tr);
+          staticGrp.add(tr);
         }
         if (Math.random() < 0.35) {
           const b = MX.makeBush();
           b.position.set(rand(5.4, 9.4), 0, -rand(4, 26));
-          node.add(b);
+          staticGrp.add(b);
         }
         if (Math.random() < 0.4) {
           const cl = MX.makeCloud();
@@ -701,7 +831,7 @@ export class World {
           node.add(cl);
           this.trackAnim(cl, z0);
         }
-        if (Math.random() < 0.55) {
+        if (Math.random() < (fx ? 0.55 : 0.32)) {
           const cols = [0x57a04a, 0x8a5bd6, 0xc63b2f, 0x3d6ea8];
           const d = MX.makeDragon(pick(cols), rand(0.7, 1.05));
           const baseX = rand(-22, 6);
@@ -780,7 +910,7 @@ export class World {
       }
     }
 
-    const tr = MX.makeTrain(len, TRAIN_SCHEMES[loc]);
+    const tr = MX.makeTrain(len, TRAIN_SCHEMES[loc], !this.lowSpec);
     tr.position.set(x, 0, z);
     if (vz === 0) {
       const chock = MX.M(MX.boxGeo(2.3, 0.22, 0.5), MX.std(0xf0a800, 0xf0a800, 0.2, 0.7), 0, 0.12, b.zFront + 0.35);
@@ -891,7 +1021,7 @@ export class World {
     const x = LANES[lane];
     const z = z0 - lz;
     if (!this.canPlaceTunnelOb(lane, z + b.zOff, b.half, true)) return;
-    const tr = MX.makeTrain(len, TRAIN_SCHEMES[loc]);
+    const tr = MX.makeTrain(len, TRAIN_SCHEMES[loc], !this.lowSpec);
     tr.position.set(x, TUNNEL_H, z);
     tr.rotation.z = Math.PI;
     this.markShadow(tr);
@@ -977,7 +1107,7 @@ export class World {
     }
     const len = 15;
     const b = MX.getTrainBounds(len, loc);
-    const tr = MX.makeTrain(len, TRAIN_SCHEMES[loc]);
+    const tr = MX.makeTrain(len, TRAIN_SCHEMES[loc], !this.lowSpec);
     const x = LANES[lane];
     tr.position.set(x, 0, zStart);
     this.markShadow(tr);

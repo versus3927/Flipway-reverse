@@ -64,21 +64,15 @@ export function cachedMat(key: string, create: () => THREE.Material): THREE.Mate
   return m;
 }
 
-/** Матовые поверхности используют быстрый MeshLambertMaterial, блестящие/металлические — MeshStandardMaterial */
-export function std(color: number, e = 0, ei = 0, rough = 0.9, metal = 0.02, flat = true): THREE.Material {
-  const useLambert = metal <= 0.1 && rough >= 0.55;
-  const k = `${useLambert ? 'lm' : 'st'}${color}|${e}|${ei}|${rough}|${metal}|${flat ? 1 : 0}`;
+/** Матовые и глянцевые низкополигональные поверхности используют быстрый MeshLambertMaterial (без тяжёлого PBR и flatShading-производных на GPU) */
+export function std(color: number, e = 0, ei = 0, _rough = 0.9, _metal = 0.02, flat = true): THREE.Material {
+  const k = `lm${color}|${e}|${ei}|${flat ? 1 : 0}`;
   let m = mats.get(k);
   if (!m) {
-    if (useLambert) {
-      m = new THREE.MeshLambertMaterial({
-        color, emissive: e, emissiveIntensity: ei, flatShading: flat,
-      });
-    } else {
-      m = new THREE.MeshStandardMaterial({
-        color, emissive: e, emissiveIntensity: ei, roughness: rough, metalness: metal, flatShading: flat,
-      });
-    }
+    m = new THREE.MeshLambertMaterial({
+      color, emissive: e, emissiveIntensity: ei, flatShading: false,
+    });
+    m.userData.flat = flat;
     mats.set(k, m);
   }
   return m;
@@ -143,43 +137,49 @@ function getMergedMat(m: THREE.Material): { key: string; mat: THREE.Material; ba
     return { key, mat: bm, bakeColor: anyM.color };
   }
 
-  if ((m as THREE.MeshLambertMaterial).isMeshLambertMaterial) {
-    const e = anyM.emissive.getHex();
-    const ei = anyM.emissiveIntensity;
-    const fl = anyM.flatShading ? 1 : 0;
-    const key = `L|${e}|${ei}|${fl}|${tr}|${op}|${sd}`;
-    let lm = bakedMats.get(key);
-    if (!lm) {
-      lm = new THREE.MeshLambertMaterial({
-        color: 0xffffff, vertexColors: true, emissive: e, emissiveIntensity: ei,
-        flatShading: !!fl, transparent: !!tr, opacity: op, side: sd,
-      });
-      bakedMats.set(key, lm);
-    }
-    return { key, mat: lm, bakeColor: anyM.color };
-  }
-
+  // Ярко светящиеся детали (лампы, глаза, стёкла фар) объединяем в единый MeshBasicMaterial
   const e = anyM.emissive ? anyM.emissive.getHex() : 0;
   const ei = anyM.emissiveIntensity ?? 0;
-  const r = anyM.roughness ?? 0.5;
-  const ml = anyM.metalness ?? 0;
-  const fl = anyM.flatShading ? 1 : 0;
-  const key = `S|${e}|${ei}|${r}|${ml}|${fl}|${tr}|${op}|${sd}`;
-  let sm = bakedMats.get(key);
-  if (!sm) {
-    sm = new THREE.MeshStandardMaterial({
-      color: 0xffffff, vertexColors: true, emissive: e, emissiveIntensity: ei,
-      roughness: r, metalness: ml, flatShading: !!fl, transparent: !!tr, opacity: op, side: sd,
-    });
-    bakedMats.set(key, sm);
+  if (e !== 0 && ei >= 0.7 && !anyM.vertexColors) {
+    const key = `B|${tr}|${op}|${sd}|${dw}`;
+    let bm = bakedMats.get(key);
+    if (!bm) {
+      bm = new THREE.MeshBasicMaterial({
+        color: 0xffffff, vertexColors: true, transparent: !!tr, opacity: op, side: sd, depthWrite: !!dw,
+      });
+      bakedMats.set(key, bm);
+    }
+    const c = anyM.color.clone().lerp(anyM.emissive, Math.min(1, 0.65 + (ei - 0.7) * 0.35));
+    return { key, mat: bm, bakeColor: c };
   }
-  return { key, mat: sm, bakeColor: anyM.color };
+
+  // Все матовые/полуматовые поверхности объединяем в единый MeshLambertMaterial с vertexColors
+  // (небольшой emissive впекаем в цвет вершины, чтобы не плодить десятки материалов и шейдеров)
+  const key = `L|${tr}|${op}|${sd}`;
+  let lm = bakedMats.get(key);
+  if (!lm) {
+    lm = new THREE.MeshLambertMaterial({
+      color: 0xffffff, vertexColors: true, flatShading: false,
+      transparent: !!tr, opacity: op, side: sd,
+    });
+    bakedMats.set(key, lm);
+  }
+  let bakeColor = anyM.color;
+  if (e !== 0 && ei > 0 && !anyM.vertexColors) {
+    const c = anyM.color.clone();
+    c.r = Math.min(1, c.r + anyM.emissive.r * ei * 0.45);
+    c.g = Math.min(1, c.g + anyM.emissive.g * ei * 0.45);
+    c.b = Math.min(1, c.b + anyM.emissive.b * ei * 0.45);
+    bakeColor = c;
+  }
+  return { key, mat: lm, bakeColor };
 }
 
 function flipWinding(g: THREE.BufferGeometry) {
   const pos = g.getAttribute('position');
   const norm = g.getAttribute('normal');
   const uv = g.getAttribute('uv');
+  const col = g.getAttribute('color');
   const swapAttr = (attr: THREE.BufferAttribute | THREE.InterleavedBufferAttribute | undefined, itemSize: number) => {
     if (!attr) return;
     const a = attr.array as Float32Array;
@@ -196,6 +196,7 @@ function flipWinding(g: THREE.BufferGeometry) {
   swapAttr(pos, 3);
   swapAttr(norm, 3);
   swapAttr(uv, 2);
+  swapAttr(col, 3);
 }
 
 /** Объединяет статические дочерние Mesh в минимальное число draw-call'ов с общими материалами */
@@ -219,28 +220,42 @@ export function bakeGroup(src: THREE.Group): THREE.Group {
     if (!bucket) { bucket = { mat, geoms: [] }; buckets.set(key, bucket); }
 
     const raw = mesh.geometry.index ? mesh.geometry.toNonIndexed() : mesh.geometry.clone();
-    // Оставляем только стандартные атрибуты, чтобы mergeGeometries никогда не падал
+    const hasExistingColor = (mesh.material as THREE.Material & { vertexColors?: boolean }).vertexColors === true && !!raw.getAttribute('color');
+    const keepColor = hasExistingColor && bakeColor !== null;
     for (const attrName of Object.keys(raw.attributes)) {
-      if (attrName !== 'position' && attrName !== 'normal' && attrName !== 'uv') {
+      if (attrName !== 'position' && attrName !== 'normal' && attrName !== 'uv' && !(keepColor && attrName === 'color')) {
         raw.deleteAttribute(attrName);
       }
-    }
-    if (!raw.getAttribute('normal')) raw.computeVertexNormals();
-    const pos = raw.getAttribute('position');
-    if (!raw.getAttribute('uv')) {
-      raw.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(pos.count * 2), 2));
     }
     raw.applyMatrix4(mesh.matrixWorld);
     if (mesh.matrixWorld.determinant() < 0) flipWinding(raw);
 
+    if (mesh.material.userData?.flat || !raw.getAttribute('normal')) {
+      raw.computeVertexNormals();
+    }
+    const pos = raw.getAttribute('position');
+    if (!raw.getAttribute('uv')) {
+      raw.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(pos.count * 2), 2));
+    }
+
     if (bakeColor) {
-      const colors = new Float32Array(pos.count * 3);
-      const r = bakeColor.r, g = bakeColor.g, b = bakeColor.b;
-      for (let i = 0; i < pos.count; i++) {
-        const o = i * 3;
-        colors[o] = r; colors[o + 1] = g; colors[o + 2] = b;
+      if (keepColor) {
+        if (bakeColor.r !== 1 || bakeColor.g !== 1 || bakeColor.b !== 1) {
+          const colAttr = raw.getAttribute('color') as THREE.BufferAttribute;
+          const arr = colAttr.array as Float32Array;
+          for (let i = 0; i < arr.length; i += 3) {
+            arr[i] *= bakeColor.r; arr[i + 1] *= bakeColor.g; arr[i + 2] *= bakeColor.b;
+          }
+        }
+      } else {
+        const colors = new Float32Array(pos.count * 3);
+        const r = bakeColor.r, g = bakeColor.g, b = bakeColor.b;
+        for (let i = 0; i < pos.count; i++) {
+          const o = i * 3;
+          colors[o] = r; colors[o + 1] = g; colors[o + 2] = b;
+        }
+        raw.setAttribute('color', new THREE.BufferAttribute(colors, 3));
       }
-      raw.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     }
     bucket.geoms.push(raw);
   });
@@ -289,7 +304,7 @@ export function getTrainBounds(len: number, loc: LocId): { zOff: number; half: n
 }
 
 /** Ледяные санки / бобслей */
-export function makeSlede(len: number, s: TrainScheme): THREE.Group {
+export function makeSlede(len: number, s: TrainScheme, withFX = true): THREE.Group {
   const g = new THREE.Group();
   const bodyMat = std(s.body, 0, 0, 0.25, 0.55); // металлический блеск
   // корпус — обтекаемый, высотой под крышу 2.60
@@ -316,14 +331,18 @@ export function makeSlede(len: number, s: TrainScheme): THREE.Group {
   // передняя часть — рог
   g.add(M(boxGeo(2.05, 1.5, 0.9), bodyMat, 0, 1.0, len / 2 + 0.7));
   g.add(M(boxGeo(0.36, 0.36, 0.36), runnerMat, 0, 1.0, len / 2 + 1.18));
-  // фары — синие
-  const fl1 = sprite(0x00e5ff, 1.2, 0.9); fl1.position.set(-0.52, 1.0, len / 2 + 1.2); g.add(fl1);
-  const fl2 = sprite(0x00e5ff, 1.2, 0.9); fl2.position.set(0.52, 1.0, len / 2 + 1.2); g.add(fl2);
+  // фары — светящиеся плашки + ореол (только в высоком качестве)
+  g.add(M(boxGeo(0.28, 0.2, 0.1), lam(0x7af2ff), -0.52, 1.0, len / 2 + 1.16));
+  g.add(M(boxGeo(0.28, 0.2, 0.1), lam(0x7af2ff), 0.52, 1.0, len / 2 + 1.16));
+  if (withFX) {
+    const fl1 = sprite(0x00e5ff, 1.2, 0.9); fl1.position.set(-0.52, 1.0, len / 2 + 1.2); g.add(fl1);
+    const fl2 = sprite(0x00e5ff, 1.2, 0.9); fl2.position.set(0.52, 1.0, len / 2 + 1.2); g.add(fl2);
+  }
   return g;
 }
 
 /** Фургон (солнечная локация) */
-export function makeVan(len: number, s: TrainScheme): THREE.Group {
+export function makeVan(len: number, s: TrainScheme, withFX = true): THREE.Group {
   const g = new THREE.Group();
   const bodyMat = std(s.body, 0, 0, 0.65, 0.15);
   // кузов
@@ -336,8 +355,8 @@ export function makeVan(len: number, s: TrainScheme): THREE.Group {
   for (let i = 0; i < Math.floor(len / 4); i++) {
     const z = -len / 2 + 2 + i * 4;
     const wm = std(0x3a3f48, 0, 0, 0.9, 0.4);
-    g.add(M(cylGeo(0.42, 0.42, 0.28, 12), wm, -1.26, 0.46, z));
-    g.add(M(cylGeo(0.42, 0.42, 0.28, 12), wm, 1.26, 0.46, z));
+    g.add(M(cylGeo(0.42, 0.42, 0.28, 10), wm, -1.26, 0.46, z));
+    g.add(M(cylGeo(0.42, 0.42, 0.28, 10), wm, 1.26, 0.46, z));
     g.add(M(cylGeo(0.22, 0.22, 0.32, 8), std(0xd0d8e0, 0, 0, 0.25, 0.8), -1.26, 0.46, z));
     g.add(M(cylGeo(0.22, 0.22, 0.32, 8), std(0xd0d8e0, 0, 0, 0.25, 0.8), 1.26, 0.46, z));
   }
@@ -348,13 +367,17 @@ export function makeVan(len: number, s: TrainScheme): THREE.Group {
   // кабина
   g.add(M(boxGeo(2.32, 2.1, 2.0), bodyMat, 0, 1.45, len / 2 + 0.9));
   g.add(M(boxGeo(1.9, 1.0, 0.16), winMat, 0, 2.0, len / 2 + 1.86));
-  const hf1 = sprite(0xffe8a0, 1.4, 0.9); hf1.position.set(-0.6, 0.8, len / 2 + 2.0); g.add(hf1);
-  const hf2 = sprite(0xffe8a0, 1.4, 0.9); hf2.position.set(0.6, 0.8, len / 2 + 2.0); g.add(hf2);
+  g.add(M(boxGeo(0.28, 0.2, 0.1), lam(0xfff0b0), -0.6, 0.8, len / 2 + 1.92));
+  g.add(M(boxGeo(0.28, 0.2, 0.1), lam(0xfff0b0), 0.6, 0.8, len / 2 + 1.92));
+  if (withFX) {
+    const hf1 = sprite(0xffe8a0, 1.4, 0.9); hf1.position.set(-0.6, 0.8, len / 2 + 2.0); g.add(hf1);
+    const hf2 = sprite(0xffe8a0, 1.4, 0.9); hf2.position.set(0.6, 0.8, len / 2 + 2.0); g.add(hf2);
+  }
   return g;
 }
 
 /** Огненная колесница / бронедракон (замок) */
-export function makeChariot(len: number, s: TrainScheme): THREE.Group {
+export function makeChariot(len: number, s: TrainScheme, withFX = true): THREE.Group {
   const g = new THREE.Group();
   const stoneM = std(s.body, 0, 0, 0.9);
   const goldM = std(0xd9a520, 0xffc93c, 0.15, 0.4, 0.6);
@@ -368,8 +391,8 @@ export function makeChariot(len: number, s: TrainScheme): THREE.Group {
   for (const z of [-len / 2 + 2, len / 2 - 2]) {
     const wm = std(0x4a2c08, 0, 0, 0.9, 0.15);
     const rim = std(0xd9a520, 0xffc93c, 0.1, 0.4, 0.7);
-    g.add(M(cylGeo(0.7, 0.72, 0.38, 12), wm, -1.28, 0.7, z));
-    g.add(M(cylGeo(0.7, 0.72, 0.38, 12), wm, 1.28, 0.7, z));
+    g.add(M(cylGeo(0.7, 0.72, 0.38, 10), wm, -1.28, 0.7, z));
+    g.add(M(cylGeo(0.7, 0.72, 0.38, 10), wm, 1.28, 0.7, z));
     g.add(M(cylGeo(0.42, 0.42, 0.42, 8), rim, -1.28, 0.7, z));
     g.add(M(cylGeo(0.42, 0.42, 0.42, 8), rim, 1.28, 0.7, z));
     for (let i = 0; i < 6; i++) {
@@ -382,15 +405,17 @@ export function makeChariot(len: number, s: TrainScheme): THREE.Group {
   head.position.set(0, 1.55, len / 2 + 1.2);
   head.add(M(boxGeo(1.6, 1.0, 1.4), stoneM, 0, 0, 0));
   head.add(M(boxGeo(1.7, 0.35, 1.2), std(s.roof, 0, 0, 0.85), 0, -0.42, 0.08));
-  head.add(M(boxGeo(0.42, 0.26, 0.1), std(0xffe14d, 0xffe14d, 0.4, 0.5), -0.4, 0.2, 0.72));
-  head.add(M(boxGeo(0.42, 0.26, 0.1), std(0xffe14d, 0xffe14d, 0.4, 0.5), 0.4, 0.2, 0.72));
-  const fire = sprite(0xff6b00, 2.2, 0.9); fire.position.set(0, 0, 0.9); head.add(fire);
+  head.add(M(boxGeo(0.42, 0.26, 0.1), lam(0xffe14d), -0.4, 0.2, 0.72));
+  head.add(M(boxGeo(0.42, 0.26, 0.1), lam(0xffe14d), 0.4, 0.2, 0.72));
+  if (withFX) {
+    const fire = sprite(0xff6b00, 2.2, 0.9); fire.position.set(0, 0, 0.9); head.add(fire);
+  }
   g.add(head);
   return g;
 }
 
 /** Мопс-мобиль (телега с мопсами) */
-export function makePugCart(len: number, s: TrainScheme): THREE.Group {
+export function makePugCart(len: number, s: TrainScheme, withFX = true): THREE.Group {
   const g = new THREE.Group();
   const bodyMat = std(s.body, 0, 0, 0.75);
   g.add(M(boxGeo(2.2, 2.0, len), bodyMat, 0, 1.35, 0));
@@ -406,18 +431,22 @@ export function makePugCart(len: number, s: TrainScheme): THREE.Group {
   const wm = std(0xcfe6f2, s.win, 0.2, 0.25, 0.2);
   for (let i = 0; i < Math.floor(len / 4); i++) {
     const z = -len / 2 + 2 + i * 4;
-    const pw1 = M(circleGeo(0.35, 12), wm, -1.12, 1.5, z); pw1.rotation.y = -Math.PI / 2; g.add(pw1);
-    const pw2 = M(circleGeo(0.35, 12), wm, 1.12, 1.5, z); pw2.rotation.y = Math.PI / 2; g.add(pw2);
+    const pw1 = M(circleGeo(0.35, 10), wm, -1.12, 1.5, z); pw1.rotation.y = -Math.PI / 2; g.add(pw1);
+    const pw2 = M(circleGeo(0.35, 10), wm, 1.12, 1.5, z); pw2.rotation.y = Math.PI / 2; g.add(pw2);
   }
   g.add(M(boxGeo(2.24, 2.0, 1.2), bodyMat, 0, 1.35, len / 2 + 0.5));
   g.add(M(boxGeo(1.1, 0.7, 0.14), std(0x3a2c22, 0, 0, 0.9), 0, 1.35, len / 2 + 1.14));
-  const fl1 = sprite(0xffd166, 1.3, 0.9); fl1.position.set(-0.55, 0.85, len / 2 + 1.2); g.add(fl1);
-  const fl2 = sprite(0xffd166, 1.3, 0.9); fl2.position.set(0.55, 0.85, len / 2 + 1.2); g.add(fl2);
+  g.add(M(boxGeo(0.28, 0.2, 0.1), lam(0xffe082), -0.55, 0.85, len / 2 + 1.12));
+  g.add(M(boxGeo(0.28, 0.2, 0.1), lam(0xffe082), 0.55, 0.85, len / 2 + 1.12));
+  if (withFX) {
+    const fl1 = sprite(0xffd166, 1.3, 0.9); fl1.position.set(-0.55, 0.85, len / 2 + 1.2); g.add(fl1);
+    const fl2 = sprite(0xffd166, 1.3, 0.9); fl2.position.set(0.55, 0.85, len / 2 + 1.2); g.add(fl2);
+  }
   return g;
 }
 
 /** Горный вагон (каньон) */
-export function makeMineCart(len: number, s: TrainScheme): THREE.Group {
+export function makeMineCart(len: number, s: TrainScheme, withFX = true): THREE.Group {
   const g = new THREE.Group();
   const wood = std(s.body, 0, 0, 0.9);
   const metal = std(s.roof, 0, 0, 0.5, 0.45);
@@ -438,25 +467,28 @@ export function makeMineCart(len: number, s: TrainScheme): THREE.Group {
     g.add(M(cylGeo(0.28, 0.28, 0.36, 8), rim, 1.18, 0.56, z));
   }
   g.add(M(boxGeo(2.16, 0.16, len * 0.9), lam(s.stripe), 0, 2.42, 0));
-  const fl = sprite(0xffe8a0, 1.4, 0.85); fl.position.set(0, 1.5, len / 2 + 0.8); g.add(fl);
+  g.add(M(boxGeo(0.32, 0.24, 0.1), lam(0xfff0b8), 0, 1.5, len / 2 + 0.86));
+  if (withFX) {
+    const fl = sprite(0xffe8a0, 1.4, 0.85); fl.position.set(0, 1.5, len / 2 + 0.8); g.add(fl);
+  }
   g.add(M(boxGeo(2.12, 2.3, 0.9), wood, 0, 1.35, len / 2 + 0.4));
   return g;
 }
 
-export function makeTrain(len: number, s: TrainScheme): THREE.Group {
+export function makeTrain(len: number, s: TrainScheme, withFX = true): THREE.Group {
   const qLen = Math.round(len);
-  const key = `tr|${s.kind ?? 'def'}|${s.body}|${s.stripe}|${qLen}`;
+  const key = `tr|${s.kind ?? 'def'}|${s.body}|${s.stripe}|${qLen}|${withFX ? 1 : 0}`;
   return cachedPrefab(key, () => {
-    if (s.kind === 'slede') return makeSlede(qLen, s);
-    if (s.kind === 'van') return makeVan(qLen, s);
-    if (s.kind === 'chariot') return makeChariot(qLen, s);
-    if (s.kind === 'pugcart') return makePugCart(qLen, s);
-    if (s.kind === 'minecart') return makeMineCart(qLen, s);
-    return makeTrainDefault(qLen, s);
+    if (s.kind === 'slede') return makeSlede(qLen, s, withFX);
+    if (s.kind === 'van') return makeVan(qLen, s, withFX);
+    if (s.kind === 'chariot') return makeChariot(qLen, s, withFX);
+    if (s.kind === 'pugcart') return makePugCart(qLen, s, withFX);
+    if (s.kind === 'minecart') return makeMineCart(qLen, s, withFX);
+    return makeTrainDefault(qLen, s, withFX);
   });
 }
 
-export function makeTrainDefault(len: number, s: TrainScheme): THREE.Group {
+export function makeTrainDefault(len: number, s: TrainScheme, withFX = true): THREE.Group {
   const g = new THREE.Group();
   const bodyMat = std(s.body, 0, 0, 0.55, 0.2);
   g.add(M(boxGeo(2.1, 2.5, len), bodyMat, 0, 1.45, 0));
@@ -478,16 +510,20 @@ export function makeTrainDefault(len: number, s: TrainScheme): THREE.Group {
   g.add(wl, wr);
   g.add(M(boxGeo(2.05, 2.3, 1.1), bodyMat, 0, 1.4, len / 2 + 0.5));
   g.add(M(boxGeo(1.7, 0.7, 0.12), std(0x0b1220, 0x9fd8ff, 0.8, 0.3), 0, 2.2, len / 2 + 1.06));
-  const h1 = sprite(0xfff2c0, 1.5, 0.95); h1.position.set(-0.62, 1.0, len / 2 + 1.1);
-  const h2 = sprite(0xfff2c0, 1.5, 0.95); h2.position.set(0.62, 1.0, len / 2 + 1.1);
-  g.add(h1, h2);
+  g.add(M(boxGeo(0.28, 0.2, 0.08), lam(0xfff5cc), -0.62, 1.0, len / 2 + 1.08));
+  g.add(M(boxGeo(0.28, 0.2, 0.08), lam(0xfff5cc), 0.62, 1.0, len / 2 + 1.08));
+  if (withFX) {
+    const h1 = sprite(0xfff2c0, 1.5, 0.95); h1.position.set(-0.62, 1.0, len / 2 + 1.1);
+    const h2 = sprite(0xfff2c0, 1.5, 0.95); h2.position.set(0.62, 1.0, len / 2 + 1.1);
+    g.add(h1, h2);
+  }
   g.add(M(boxGeo(0.18, 0.18, 0.06), lam(0xff3040), 0, 1.0, len / 2 + 1.08));
   return g;
 }
 
 // ── Препятствия: ПОЛ (низкие, обходятся сальтом/прыжком) ─────
-export function makeFloorObstacle(loc: LocId): THREE.Group {
-  const variant = loc === 'sunny' ? (Math.random() < 0.5 ? 0 : 1) : 0;
+export function makeFloorObstacle(loc: LocId, variantOpt?: number): THREE.Group {
+  const variant = loc === 'sunny' ? (variantOpt !== undefined ? variantOpt % 2 : (Math.random() < 0.5 ? 0 : 1)) : 0;
   return cachedPrefab(`floorOb|${loc}|${variant}`, () => {
     const g = new THREE.Group();
     if (loc === 'metro') {
@@ -594,7 +630,7 @@ export function makeCeilObstacle(loc: LocId): THREE.Group {
 export function makeRollBar(loc: LocId, onCeiling = false): THREE.Group {
   const s = onCeiling ? -1 : 1;
   const base = onCeiling ? TUNNEL_H : 0;
-  const g = cachedPrefab(`rollBar|${loc}|${onCeiling ? 1 : 0}`, () => {
+  return cachedPrefab(`rollBar|${loc}|${onCeiling ? 1 : 0}`, () => {
     const fg = new THREE.Group();
     const cfg = LOCS[loc];
     const haz = cachedMat('hazRoll', () => new THREE.MeshLambertMaterial({
@@ -611,10 +647,6 @@ export function makeRollBar(loc: LocId, onCeiling = false): THREE.Group {
     fg.add(M(boxGeo(0.16, 1.4, 0.3), std(0x333c4f), 1.02, base + s * 0.7, 0));
     return fg;
   });
-  const sp = sprite(0xf7c948, 1.8, 0.55);
-  sp.position.set(0, base + s * 1.62, 0.3);
-  g.add(sp);
-  return g;
 }
 
 /** Полноростовой блок — только смена дорожки */
@@ -640,14 +672,16 @@ export function getCoinMeshData(): { geometry: THREE.BufferGeometry; material: T
   if (!coinGeoCache || !coinMatCache) {
     const tmp = new THREE.Group();
     const gold = std(0xf7c948, 0xffb300, 0.55, 0.3, 0.7, false);
-    const c = M(cylGeo(0.3, 0.3, 0.07, 14), gold);
+    const c = M(cylGeo(0.3, 0.3, 0.07, 12), gold);
     c.rotation.x = Math.PI / 2;
     const rim = M(torGeo(0.3, 0.045), std(0xffe083, 0xffc93c, 0.55, 0.3, 0.7, false));
     tmp.add(c, rim);
     const baked = bakeGroup(tmp);
     const m = baked.children[0] as THREE.Mesh;
     coinGeoCache = m.geometry;
-    coinMatCache = m.material as THREE.Material;
+    coinMatCache = new THREE.MeshLambertMaterial({
+      vertexColors: true, emissive: 0xffaa00, emissiveIntensity: 0.35,
+    });
   }
   return { geometry: coinGeoCache, material: coinMatCache };
 }
@@ -713,44 +747,57 @@ function wingGeo() {
   return wingGeoCache;
 }
 
-export function makeDragon(color = 0xc63b2f, scaleV = 1): THREE.Group {
-  const g = new THREE.Group();
-  const skin = std(color, 0, 0, 0.8);
-  const darkCol = new THREE.Color(color).multiplyScalar(0.6).getHex();
-  const dark = std(darkCol, 0, 0, 0.85);
-  const wingCol = new THREE.Color(color).multiplyScalar(0.85).getHex();
-  const wingMat = cachedMat(`wing|${wingCol}`, () => new THREE.MeshLambertMaterial({
-    color: wingCol, side: THREE.DoubleSide, flatShading: true,
-  }));
+const dragonPartCache = new Map<number, { body: THREE.Group; head: THREE.Group; wingMat: THREE.Material }>();
 
-  const body = M(sphGeo(0.85, 10, 8), skin, 0, 0, 0);
-  body.scale.set(0.72, 0.68, 1.6);
-  g.add(body);
-  for (let i = 0; i < 4; i++) {
-    g.add(M(coneGeo(0.11, 0.35, 4), dark, 0, 0.62, -0.5 + i * 0.42));
+export function makeDragon(color = 0xc63b2f, scaleV = 1): THREE.Group {
+  let parts = dragonPartCache.get(color);
+  if (!parts) {
+    const skin = std(color, 0, 0, 0.8);
+    const darkCol = new THREE.Color(color).multiplyScalar(0.6).getHex();
+    const dark = std(darkCol, 0, 0, 0.85);
+    const wingCol = new THREE.Color(color).multiplyScalar(0.85).getHex();
+    const wingMat = cachedMat(`wing|${wingCol}`, () => new THREE.MeshLambertMaterial({
+      color: wingCol, side: THREE.DoubleSide, flatShading: false,
+    }));
+
+    const bodyRaw = new THREE.Group();
+    const body = M(sphGeo(0.85, 9, 7), skin, 0, 0, 0);
+    body.scale.set(0.72, 0.68, 1.6);
+    bodyRaw.add(body);
+    for (let i = 0; i < 4; i++) {
+      bodyRaw.add(M(coneGeo(0.11, 0.35, 4), dark, 0, 0.62, -0.5 + i * 0.42));
+    }
+    const neck = M(cylGeo(0.16, 0.3, 0.9, 6), skin, 0, 0.42, -1.2);
+    neck.rotation.x = -0.9;
+    bodyRaw.add(neck);
+    const tail = M(coneGeo(0.24, 1.6, 6), skin, 0, 0.1, 1.7);
+    tail.rotation.x = Math.PI / 2;
+    bodyRaw.add(tail);
+    bodyRaw.add(M(cylGeo(0.08, 0.1, 0.4, 5), dark, -0.35, -0.55, -0.5));
+    bodyRaw.add(M(cylGeo(0.08, 0.1, 0.4, 5), dark, 0.35, -0.55, -0.5));
+
+    const headRaw = new THREE.Group();
+    headRaw.add(M(boxGeo(0.46, 0.4, 0.6), skin, 0, 0, 0));
+    headRaw.add(M(boxGeo(0.3, 0.22, 0.4), skin, 0, -0.05, -0.42));
+    headRaw.add(M(sphGeo(0.05, 6, 5), lam(0xffe14d), -0.16, 0.08, -0.26));
+    headRaw.add(M(sphGeo(0.05, 6, 5), lam(0xffe14d), 0.16, 0.08, -0.26));
+    const h1 = M(coneGeo(0.07, 0.3, 4), dark, -0.14, 0.28, 0.14); h1.rotation.x = 0.5;
+    const h2 = M(coneGeo(0.07, 0.3, 4), dark, 0.14, 0.28, 0.14); h2.rotation.x = 0.5;
+    headRaw.add(h1, h2);
+
+    parts = { body: bakeGroup(bodyRaw), head: bakeGroup(headRaw), wingMat };
+    dragonPartCache.set(color, parts);
   }
-  const neck = M(cylGeo(0.16, 0.3, 0.9, 6), skin, 0, 0.42, -1.2);
-  neck.rotation.x = -0.9;
-  g.add(neck);
-  const head = new THREE.Group();
+
+  const g = new THREE.Group();
+  g.add(parts.body.clone());
+  const head = parts.head.clone();
   head.position.set(0, 0.78, -1.62);
-  head.add(M(boxGeo(0.46, 0.4, 0.6), skin, 0, 0, 0));
-  head.add(M(boxGeo(0.3, 0.22, 0.4), skin, 0, -0.05, -0.42));
-  head.add(M(sphGeo(0.05, 6, 5), lam(0xffe14d), -0.16, 0.08, -0.26));
-  head.add(M(sphGeo(0.05, 6, 5), lam(0xffe14d), 0.16, 0.08, -0.26));
-  const h1 = M(coneGeo(0.07, 0.3, 4), dark, -0.14, 0.28, 0.14); h1.rotation.x = 0.5;
-  const h2 = M(coneGeo(0.07, 0.3, 4), dark, 0.14, 0.28, 0.14); h2.rotation.x = 0.5;
-  head.add(h1, h2);
   g.add(head);
-  const tail = M(coneGeo(0.24, 1.6, 6), skin, 0, 0.1, 1.7);
-  tail.rotation.x = Math.PI / 2;
-  g.add(tail);
-  g.add(M(cylGeo(0.08, 0.1, 0.4, 5), dark, -0.35, -0.55, -0.5));
-  g.add(M(cylGeo(0.08, 0.1, 0.4, 5), dark, 0.35, -0.55, -0.5));
   const wl = new THREE.Group(); wl.position.set(0.3, 0.4, -0.2);
-  const wlm = new THREE.Mesh(wingGeo(), wingMat); wlm.scale.setScalar(1.5); wl.add(wlm);
+  const wlm = new THREE.Mesh(wingGeo(), parts.wingMat); wlm.scale.setScalar(1.5); wl.add(wlm);
   const wr = new THREE.Group(); wr.position.set(-0.3, 0.4, -0.2);
-  const wrm = new THREE.Mesh(wingGeo(), wingMat); wrm.scale.set(-1.5, 1.5, 1.5); wr.add(wrm);
+  const wrm = new THREE.Mesh(wingGeo(), parts.wingMat); wrm.scale.set(-1.5, 1.5, 1.5); wr.add(wrm);
   g.add(wl, wr);
   const phase = Math.random() * 10;
   g.userData.tick = (t: number) => {
@@ -812,35 +859,43 @@ export function makeFireWarn(): THREE.Mesh {
   return m;
 }
 
+let pugPartCache: { body: THREE.Group; head: THREE.Group } | null = null;
+
 // ── МОПС ───────────────────────────────────────────────────────
 export function makePug(): THREE.Group {
-  const g = new THREE.Group();
-  const tan = std(0xc9a06c, 0, 0, 0.95);
-  const darkF = std(0x3a2c22, 0, 0, 0.95);
-  const torso = M(boxGeo(0.56, 0.44, 0.82), tan, 0, 0.38, 0);
-  g.add(torso);
-  const head = new THREE.Group();
-  head.position.set(0, 0.62, -0.48);
-  head.add(M(boxGeo(0.44, 0.4, 0.38), tan, 0, 0, 0));
-  head.add(M(boxGeo(0.22, 0.16, 0.12), darkF, 0, -0.06, -0.22));
-  head.add(M(sphGeo(0.045, 6, 5), lam(0x14100c), -0.12, 0.06, -0.19));
-  head.add(M(sphGeo(0.045, 6, 5), lam(0x14100c), 0.12, 0.06, -0.19));
-  const e1 = M(boxGeo(0.1, 0.14, 0.05), darkF, -0.16, 0.24, -0.02); e1.rotation.z = 0.35;
-  const e2 = M(boxGeo(0.1, 0.14, 0.05), darkF, 0.16, 0.24, -0.02); e2.rotation.z = -0.35;
-  head.add(e1, e2);
-  g.add(head);
-  for (const [x, z] of [[-0.18, -0.28], [0.18, -0.28], [-0.18, 0.28], [0.18, 0.28]] as const) {
-    g.add(M(boxGeo(0.11, 0.24, 0.11), darkF, x, 0.12, z));
+  if (!pugPartCache) {
+    const tan = std(0xc9a06c, 0, 0, 0.95);
+    const darkF = std(0x3a2c22, 0, 0, 0.95);
+
+    const bodyRaw = new THREE.Group();
+    bodyRaw.add(M(boxGeo(0.56, 0.44, 0.82), tan, 0, 0.38, 0));
+    for (const [x, z] of [[-0.18, -0.28], [0.18, -0.28], [-0.18, 0.28], [0.18, 0.28]] as const) {
+      bodyRaw.add(M(boxGeo(0.11, 0.24, 0.11), darkF, x, 0.12, z));
+    }
+    const tail = M(torGeo(0.09, 0.035), tan, 0, 0.6, 0.42);
+    tail.rotation.set(0.3, 0.4, 0);
+    bodyRaw.add(tail);
+
+    const headRaw = new THREE.Group();
+    headRaw.add(M(boxGeo(0.44, 0.4, 0.38), tan, 0, 0, 0));
+    headRaw.add(M(boxGeo(0.22, 0.16, 0.12), darkF, 0, -0.06, -0.22));
+    headRaw.add(M(sphGeo(0.045, 6, 5), lam(0x14100c), -0.12, 0.06, -0.19));
+    headRaw.add(M(sphGeo(0.045, 6, 5), lam(0x14100c), 0.12, 0.06, -0.19));
+    const e1 = M(boxGeo(0.1, 0.14, 0.05), darkF, -0.16, 0.24, -0.02); e1.rotation.z = 0.35;
+    const e2 = M(boxGeo(0.1, 0.14, 0.05), darkF, 0.16, 0.24, -0.02); e2.rotation.z = -0.35;
+    headRaw.add(e1, e2);
+
+    pugPartCache = { body: bakeGroup(bodyRaw), head: bakeGroup(headRaw) };
   }
-  const tail = M(torGeo(0.09, 0.035), tan, 0, 0.6, 0.42);
-  tail.rotation.set(0.3, 0.4, 0);
-  g.add(tail);
+  const g = new THREE.Group();
+  const body = pugPartCache.body.clone();
+  const head = pugPartCache.head.clone();
+  head.position.set(0, 0.62, -0.48);
+  g.add(body, head);
   const phase = Math.random() * 10;
   g.userData.tick = (t: number) => {
-    const b = Math.abs(Math.sin(t * 6 + phase)) * 0.05;
-    torso.position.y = 0.38 + b;
+    body.position.y = Math.abs(Math.sin(t * 6 + phase)) * 0.05;
     head.rotation.z = Math.sin(t * 5 + phase) * 0.08;
-    tail.rotation.z = Math.sin(t * 9 + phase) * 0.4;
   };
   return g;
 }
@@ -966,7 +1021,7 @@ export function makePalace(variant: 'keep' | 'tower' | 'wall'): THREE.Group {
   });
 }
 
-export function makeMoat(len: number): THREE.Group {
+export function makeMoat(len: number, withFX = true): THREE.Group {
   const g = new THREE.Group();
   const water = cachedMat('moatWater', () => new THREE.MeshLambertMaterial({
     color: 0x1f6fc9, emissive: 0x2a86e8, emissiveIntensity: 0.25, transparent: true, opacity: 0.92,
@@ -974,12 +1029,14 @@ export function makeMoat(len: number): THREE.Group {
   const w = M(planeGeo(6.4, len), water, 0, -0.18, -len / 2);
   w.rotation.x = -Math.PI / 2;
   g.add(w);
-  for (let i = 0; i < 4; i++) {
-    const s = sprite(0x9fd4ff, 0.5 + Math.random() * 0.4, 0.5);
-    s.position.set(rand(-2.6, 2.6), 0.05, -rand(2, len - 2));
-    const baseY = 0.05, ph = Math.random() * 7;
-    s.userData.tick = (t: number) => { s.position.y = baseY + Math.sin(t * 2 + ph) * 0.06; };
-    g.add(s);
+  if (withFX) {
+    for (let i = 0; i < 3; i++) {
+      const s = sprite(0x9fd4ff, 0.5 + Math.random() * 0.4, 0.5);
+      s.position.set(rand(-2.6, 2.6), 0.05, -rand(2, len - 2));
+      const baseY = 0.05, ph = Math.random() * 7;
+      s.userData.tick = (t: number) => { s.position.y = baseY + Math.sin(t * 2 + ph) * 0.06; };
+      g.add(s);
+    }
   }
   return g;
 }
@@ -1000,8 +1057,8 @@ export function makeRailingRow(len: number): THREE.Group {
 }
 
 // ── Ворота-разделитель локаций ─────────────────────────────────
-export function makeGate(x0: number, x1: number, color: number): THREE.Group {
-  return cachedPrefab(`gate|${x0}|${x1}|${color}`, () => {
+export function makeGate(x0: number, x1: number, color: number, withFX = true): THREE.Group {
+  return cachedPrefab(`gate|${x0}|${x1}|${color}|${withFX ? 1 : 0}`, () => {
     const g = new THREE.Group();
     const w = x1 - x0;
     const cx = (x0 + x1) / 2;
@@ -1011,7 +1068,9 @@ export function makeGate(x0: number, x1: number, color: number): THREE.Group {
     g.add(M(boxGeo(w + 0.7, 0.6, 0.9), mat, cx, TUNNEL_H + 0.1, 0));
     g.add(M(boxGeo(w + 0.5, 0.14, 0.95), lam(color), cx, TUNNEL_H - 0.28, 0));
     for (const x of [x0, x1]) g.add(M(boxGeo(0.74, 0.14, 0.84), lam(color), x, TUNNEL_H * 0.55, 0));
-    const s = sprite(color, 5, 0.4); s.position.set(cx, TUNNEL_H / 2, 0); g.add(s);
+    if (withFX) {
+      const s = sprite(color, 5, 0.4); s.position.set(cx, TUNNEL_H / 2, 0); g.add(s);
+    }
     return g;
   });
 }
@@ -1031,7 +1090,7 @@ export function makeArrow(dir: 'left' | 'right', color: number): THREE.Group {
 
 /** Баррикада на конце улицы замка */
 export function makeBarricade(w: number): THREE.Group {
-  const g = cachedPrefab(`barricade|${w}`, () => {
+  return cachedPrefab(`barricade|${w}`, () => {
     const fg = new THREE.Group();
     const haz = cachedMat('hazBar', () => new THREE.MeshLambertMaterial({
       map: hazardTex(4, 1), emissive: 0xff5722, emissiveIntensity: 0.18,
@@ -1041,17 +1100,15 @@ export function makeBarricade(w: number): THREE.Group {
     for (const x of [-w / 2 + 0.3, 0, w / 2 - 0.3]) {
       fg.add(M(boxGeo(0.2, 2.6, 0.3), std(0x2a2f3d), x, 1.3, 0));
     }
+    fg.add(M(boxGeo(0.3, 0.24, 0.3), lam(0xff3040), -w / 2 + 0.3, 2.75, 0));
+    fg.add(M(boxGeo(0.3, 0.24, 0.3), lam(0xff3040), w / 2 - 0.3, 2.75, 0));
     return fg;
   });
-  const s1 = sprite(0xff3040, 1.2, 0.9); s1.position.set(-w / 2 + 0.3, 2.85, 0);
-  const s2 = sprite(0xff3040, 1.2, 0.9); s2.position.set(w / 2 - 0.3, 2.85, 0);
-  g.add(s1, s2);
-  return g;
 }
 
 // ── Облака, деревья, кусты-декор ───────────────────────────────
-export function makeCloud(): THREE.Group {
-  const v = Math.floor(Math.random() * 4);
+export function makeCloud(variantOpt?: number): THREE.Group {
+  const v = variantOpt !== undefined ? variantOpt % 4 : Math.floor(Math.random() * 4);
   const g = cachedPrefab(`cloud|${v}`, () => {
     const fg = new THREE.Group();
     const m = std(0xffffff, 0, 0, 1, 0, false);
@@ -1084,9 +1141,9 @@ export function makeTree(): THREE.Group {
 const STORE_WALLS = [0xfff2f8, 0xffe9d9, 0xf3f0ff, 0xfdf6e3];
 const STORE_WORDS = ['МОПС', 'PUG', 'ЛАПА', 'ВКУСНО', 'DOG'];
 
-export function makeStorefront(side: number, accent: number): THREE.Group {
+export function makeStorefront(side: number, accent: number, variantOpt?: number): THREE.Group {
   void accent;
-  const v = Math.floor(Math.random() * 4);
+  const v = variantOpt !== undefined ? variantOpt % 4 : Math.floor(Math.random() * 4);
   return cachedPrefab(`store|${side}|${v}`, () => {
     const g = new THREE.Group();
     const h = 5.6 + v * 0.55;
@@ -1115,13 +1172,15 @@ export function makeStorefront(side: number, accent: number): THREE.Group {
   });
 }
 
-export function makeLantern(): THREE.Group {
-  const g = cachedPrefab('lantern', () => {
+export function makeLantern(withFX = true): THREE.Group {
+  const g = cachedPrefab(`lantern|${withFX ? 1 : 0}`, () => {
     const fg = new THREE.Group();
     fg.add(M(cylGeo(0.02, 0.02, 0.8, 4), lam(0x111418), 0, 0.4, 0));
     fg.add(M(boxGeo(0.34, 0.42, 0.34), std(0xffb96b, 0xffa64d, 0.9, 0.6), 0, -0.2, 0));
     fg.add(M(boxGeo(0.4, 0.08, 0.4), lam(0x111418), 0, 0.05, 0));
-    const s = sprite(0xffb96b, 1.3, 0.55); s.position.set(0, -0.2, 0); fg.add(s);
+    if (withFX) {
+      const s = sprite(0xffb96b, 1.3, 0.55); s.position.set(0, -0.2, 0); fg.add(s);
+    }
     return fg;
   });
   const ph = Math.random() * 6;
@@ -1144,9 +1203,9 @@ export function makeBunting(): THREE.Group {
 }
 
 // ── Лёд: кристаллы, сосульки ───────────────────────────────────
-export function makeCrystalCluster(): THREE.Group {
-  const v = Math.floor(Math.random() * 3);
-  return cachedPrefab(`cryst|${v}`, () => {
+export function makeCrystalCluster(withFX = true, variantOpt?: number): THREE.Group {
+  const v = variantOpt !== undefined ? variantOpt % 3 : Math.floor(Math.random() * 3);
+  return cachedPrefab(`cryst|${v}|${withFX ? 1 : 0}`, () => {
     const g = new THREE.Group();
     const m = std(0x66d9ff, 0x00e5ff, 0.7, 0.3);
     for (let i = 0; i < 3; i++) {
@@ -1155,13 +1214,15 @@ export function makeCrystalCluster(): THREE.Group {
       c.rotation.set(idx * 0.35, idx * 1.1, i * 0.4);
       g.add(c);
     }
-    const s = sprite(0x00e5ff, 2.2, 0.3); s.position.y = 0.6; g.add(s);
+    if (withFX) {
+      const s = sprite(0x00e5ff, 2.2, 0.3); s.position.y = 0.6; g.add(s);
+    }
     return g;
   });
 }
 
-export function makeIcicle(): THREE.Group {
-  const v = Math.floor(Math.random() * 3);
+export function makeIcicle(variantOpt?: number): THREE.Group {
+  const v = variantOpt !== undefined ? variantOpt % 3 : Math.floor(Math.random() * 3);
   return cachedPrefab(`icicle|${v}`, () => {
     const g = new THREE.Group();
     const m = std(0xbfeaff, 0x66d9ff, 0.3, 0.35);
@@ -1175,8 +1236,8 @@ export function makeIcicle(): THREE.Group {
 // ── Каньон: скалы, кактусы, hoodoo ─────────────────────────────
 const ROCK_COLS = [0x8a4f2c, 0x9d5c33, 0x74401f];
 
-export function makeRockWall(): THREE.Group {
-  const v = Math.floor(Math.random() * 4);
+export function makeRockWall(variantOpt?: number): THREE.Group {
+  const v = variantOpt !== undefined ? variantOpt % 4 : Math.floor(Math.random() * 4);
   return cachedPrefab(`rockWall|${v}`, () => {
     const g = new THREE.Group();
     const n = 2 + (v % 2);
@@ -1203,8 +1264,8 @@ export function makeCactus(): THREE.Group {
   });
 }
 
-export function makeHoodoo(): THREE.Group {
-  const v = Math.floor(Math.random() * 3);
+export function makeHoodoo(variantOpt?: number): THREE.Group {
+  const v = variantOpt !== undefined ? variantOpt % 3 : Math.floor(Math.random() * 3);
   return cachedPrefab(`hoodoo|${v}`, () => {
     const g = new THREE.Group();
     const h = 3.6 + v * 0.9;
@@ -1219,8 +1280,8 @@ export function makeHoodoo(): THREE.Group {
 // ── Метро: панели, колонны, балки ─────────────────────────────
 const METRO_WALLS = [0xf2f4f8, 0xe9edf3, 0xf6f0e6, 0xeaf1f6];
 
-export function makeBuilding(side: number, accent: number): THREE.Group {
-  const v = Math.floor(Math.random() * 4);
+export function makeBuilding(side: number, accent: number, variantOpt?: number): THREE.Group {
+  const v = variantOpt !== undefined ? variantOpt % 4 : Math.floor(Math.random() * 4);
   return cachedPrefab(`metroBld|${side}|${accent}|${v}`, () => {
     const g = new THREE.Group();
     const h = 7.5 + v * 1.4;
@@ -1254,8 +1315,8 @@ export function makePillar(accent: number): THREE.Group {
 // ── СОЛНЕЧНЫЙ ПАССАЖ ──────────────────────────────────────────
 const SUNNY_WALLS = [0xf7f1e4, 0xffe9d6, 0xf3e3ef, 0xe7f2f7];
 
-export function makeSunnyBuilding(side: number): THREE.Group {
-  const v = Math.floor(Math.random() * 4);
+export function makeSunnyBuilding(side: number, variantOpt?: number): THREE.Group {
+  const v = variantOpt !== undefined ? variantOpt % 4 : Math.floor(Math.random() * 4);
   return cachedPrefab(`sunnyBld|${side}|${v}`, () => {
     const g = new THREE.Group();
     const h = 7.6 + v * 0.7;
@@ -1267,9 +1328,9 @@ export function makeSunnyBuilding(side: number): THREE.Group {
       for (const y of [2.4, 5.0]) {
         g.add(M(boxGeo(0.12, 1.3, 1.5), winMat, -side * 0.02, y, z));
         g.add(M(boxGeo(0.26, 0.1, 1.8), std(0xffffff, 0, 0, 0.7), -side * 0.1, y - 0.72, z));
-        for (let k = 0; k < 5; k++) {
-          g.add(M(cylGeo(0.02, 0.02, 0.4, 4), std(0xd8dde4), -side * 0.16, y - 0.5, z - 0.7 + k * 0.35));
-        }
+        g.add(M(boxGeo(0.05, 0.06, 1.7), std(0xd8dde4), -side * 0.16, y - 0.35, z));
+        g.add(M(boxGeo(0.05, 0.35, 0.05), std(0xd8dde4), -side * 0.16, y - 0.52, z - 0.78));
+        g.add(M(boxGeo(0.05, 0.35, 0.05), std(0xd8dde4), -side * 0.16, y - 0.52, z + 0.78));
         g.add(M(sphGeo(0.12, 6, 5), std(0xff6f91, 0xff6f91, 0.15, 0.9), -side * 0.16, y - 0.52, z + ((i + v) % 3 - 1) * 0.35));
       }
     }
@@ -1284,16 +1345,18 @@ export function makeSunnyBuilding(side: number): THREE.Group {
 }
 
 /** Стеклянная крыша-пассаж: лёгкий прозрачный материал без дорогого transmission-рендерпасса */
-export function makeGlassRoof(len: number): THREE.Group {
-  return cachedPrefab(`glassRoof|${len}`, () => {
+export function makeGlassRoof(len: number, withGlass = true): THREE.Group {
+  return cachedPrefab(`glassRoof|${len}|${withGlass ? 1 : 0}`, () => {
     const g = new THREE.Group();
-    const glass = cachedMat('glassRoofMat', () => new THREE.MeshLambertMaterial({
-      color: 0xd9f2ff, emissive: 0x99d9f7, emissiveIntensity: 0.18,
-      transparent: true, opacity: 0.28, depthWrite: false, side: THREE.DoubleSide,
-    }));
-    const p = M(planeGeo(12, len), glass, 0, TUNNEL_H, -len / 2);
-    p.rotation.x = Math.PI / 2;
-    g.add(p);
+    if (withGlass) {
+      const glass = cachedMat('glassRoofMat', () => new THREE.MeshLambertMaterial({
+        color: 0xd9f2ff, emissive: 0x99d9f7, emissiveIntensity: 0.18,
+        transparent: true, opacity: 0.28, depthWrite: false, side: THREE.DoubleSide,
+      }));
+      const p = M(planeGeo(12, len), glass, 0, TUNNEL_H, -len / 2);
+      p.rotation.x = Math.PI / 2;
+      g.add(p);
+    }
     const frame = std(0xf5f7fa, 0, 0, 0.6, 0.2);
     for (let i = 0; i <= len / 3; i++) {
       g.add(M(boxGeo(12, 0.16, 0.16), frame, 0, TUNNEL_H - 0.08, -i * 3));
@@ -1305,16 +1368,18 @@ export function makeGlassRoof(len: number): THREE.Group {
 }
 
 /** Застеклённый световой фонарь в потолке */
-export function makeSkylight(len: number): THREE.Group {
-  return cachedPrefab(`skylight|${len}`, () => {
+export function makeSkylight(len: number, withGlass = true): THREE.Group {
+  return cachedPrefab(`skylight|${len}|${withGlass ? 1 : 0}`, () => {
     const g = new THREE.Group();
-    const glass = cachedMat('skylightGlass', () => new THREE.MeshLambertMaterial({
-      color: 0xeef6ff, emissive: 0xfff8e6, emissiveIntensity: 0.16,
-      transparent: true, opacity: 0.55, depthWrite: false, side: THREE.DoubleSide,
-    }));
-    const p = M(planeGeo(5.2, len - 1), glass, 0, TUNNEL_H - 0.04, -len / 2);
-    p.rotation.x = Math.PI / 2;
-    g.add(p);
+    if (withGlass) {
+      const glass = cachedMat('skylightGlass', () => new THREE.MeshLambertMaterial({
+        color: 0xeef6ff, emissive: 0xfff8e6, emissiveIntensity: 0.16,
+        transparent: true, opacity: 0.55, depthWrite: false, side: THREE.DoubleSide,
+      }));
+      const p = M(planeGeo(5.2, len - 1), glass, 0, TUNNEL_H - 0.04, -len / 2);
+      p.rotation.x = Math.PI / 2;
+      g.add(p);
+    }
     const frame = std(0xf2f5f9, 0, 0, 0.6, 0.2);
     for (let i = 0; i <= (len - 1) / 2.5; i++) {
       g.add(M(boxGeo(5.4, 0.14, 0.14), frame, 0, TUNNEL_H - 0.1, -0.5 - i * 2.5));
@@ -1359,14 +1424,16 @@ export function makePalm(): THREE.Group {
   });
 }
 
-export function makeStreetLamp(): THREE.Group {
-  return cachedPrefab('streetLamp', () => {
+export function makeStreetLamp(withFX = true): THREE.Group {
+  return cachedPrefab(`streetLamp|${withFX ? 1 : 0}`, () => {
     const g = new THREE.Group();
     g.add(M(cylGeo(0.07, 0.11, 3.6, 8), std(0x3a4453, 0, 0, 0.6, 0.4), 0, 1.8, 0));
     g.add(M(boxGeo(0.1, 0.1, 0.7), std(0x3a4453), 0, 3.55, -0.3));
     g.add(M(sphGeo(0.22, 8, 6), std(0xfff6d6, 0xfff0b8, 1.4, 0.3), 0, 3.45, -0.6));
-    const s = sprite(0xfff0b8, 2.0, 0.45); s.position.set(0, 3.45, -0.6);
-    g.add(s);
+    if (withFX) {
+      const s = sprite(0xfff0b8, 2.0, 0.45); s.position.set(0, 3.45, -0.6);
+      g.add(s);
+    }
     return g;
   });
 }
@@ -1383,33 +1450,34 @@ export function makeBench(): THREE.Group {
   });
 }
 
-export function makeFountain(): THREE.Group {
+export function makeFountain(withFX = true): THREE.Group {
   const g = cachedPrefab('fountain', () => {
     const fg = new THREE.Group();
     const stone = std(0xe4dccb, 0, 0, 0.9);
-    fg.add(M(cylGeo(1.5, 1.6, 0.5, 14), stone, 0, 0.25, 0));
+    fg.add(M(cylGeo(1.5, 1.6, 0.5, 12), stone, 0, 0.25, 0));
     const water = cachedMat('fountWater', () => new THREE.MeshLambertMaterial({
       color: 0x53c1f0, emissive: 0x2f9fd6, emissiveIntensity: 0.3, transparent: true, opacity: 0.85,
     }));
     const w = M(planeGeo(2.6, 2.6), water, 0, 0.52, 0); w.rotation.x = -Math.PI / 2;
     fg.add(w);
-    fg.add(M(cylGeo(0.18, 0.28, 1.1, 10), stone, 0, 1.0, 0));
-    fg.add(M(cylGeo(0.75, 0.2, 0.2, 12), stone, 0, 1.55, 0));
+    fg.add(M(cylGeo(0.18, 0.28, 1.1, 8), stone, 0, 1.0, 0));
+    fg.add(M(cylGeo(0.75, 0.2, 0.2, 10), stone, 0, 1.55, 0));
     return fg;
   });
-  const jet = sprite(0xd6f3ff, 1.7, 0.55); jet.position.set(0, 2.0, 0);
-  g.add(jet);
-  const ph = Math.random() * 5;
-  g.userData.tick = (t: number) => { jet.position.y = 2.0 + Math.sin(t * 3 + ph) * 0.12; };
+  if (withFX) {
+    const jet = sprite(0xd6f3ff, 1.7, 0.55); jet.position.set(0, 2.0, 0);
+    g.add(jet);
+    const ph = Math.random() * 5;
+    g.userData.tick = (t: number) => { jet.position.y = 2.0 + Math.sin(t * 3 + ph) * 0.12; };
+  }
   return g;
 }
 
 export function makeCeilLight(color: number): THREE.Group {
   return cachedPrefab(`ceilLight|${color}`, () => {
     const g = new THREE.Group();
-    g.add(M(boxGeo(4.6, 0.1, 0.44), std(0xfffdf5, color, 0.65, 0.4), 0, 0, 0));
+    g.add(M(boxGeo(4.6, 0.1, 0.44), std(0xfffdf5, color, 0.75, 0.4), 0, 0, 0));
     g.add(M(boxGeo(4.8, 0.12, 0.6), std(0xd8dee6, 0, 0, 0.6, 0.3), 0, 0.1, 0));
-    const s = sprite(color, 2.2, 0.1); g.add(s);
     return g;
   });
 }

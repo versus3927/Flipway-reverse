@@ -12,7 +12,7 @@ function toTex(c: HTMLCanvasElement, repX = 1, repY = 1) {
   t.wrapS = THREE.RepeatWrapping;
   t.wrapT = THREE.RepeatWrapping;
   if (repX !== 1 || repY !== 1) t.repeat.set(repX, repY);
-  t.anisotropy = 2;
+  t.anisotropy = 1;
   return t;
 }
 

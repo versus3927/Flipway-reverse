@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { GEN_AHEAD, LOCS, LocId, TUNNEL_H, css, rand } from './config';
+import { LOCS, LocId, TUNNEL_H, css, detectLowSpecDefault, rand } from './config';
 import { World } from './world';
 import { Player } from './player';
 import { Particles, SpeedStreaks } from './particles';
@@ -35,6 +35,7 @@ export class Game {
   private ambient: THREE.AmbientLight;
   private heroLight: THREE.PointLight;
   private lowSpec: boolean;
+  private ultraLow = false;
   private manualPerfOverride: boolean;
 
   private world: World;
@@ -72,6 +73,7 @@ export class Game {
   private camRotZ = 0; // угол переворота камеры
   private exitCastleTimer: number | null = null;
   private slowFrames = 0;
+  private lowSlowFrames = 0;
 
   // цветовые цели для плавного перехода локаций
   private tgt = {
@@ -88,18 +90,16 @@ export class Game {
     this.cb = cb;
     const saved = localStorage.getItem('gr_low');
     this.manualPerfOverride = saved === '1' || saved === '0';
-    const isTouch = matchMedia('(pointer: coarse)').matches;
-    const cores = navigator.hardwareConcurrency ?? 4;
-    this.lowSpec = saved === '1' ? true : saved === '0' ? false : (isTouch || cores <= 4);
+    this.lowSpec = detectLowSpecDefault();
 
     this.renderer = new THREE.WebGLRenderer({
       antialias: !this.lowSpec,
       powerPreference: 'high-performance',
       stencil: false,
     });
-    this.renderer.setPixelRatio(this.lowSpec ? 1 : Math.min(window.devicePixelRatio || 1, 1.5));
+    this.renderer.setPixelRatio(this.lowSpec ? Math.min(window.devicePixelRatio || 1, 0.85) : Math.min(window.devicePixelRatio || 1, 1.5));
     this.renderer.setSize(mount.clientWidth, mount.clientHeight);
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMapping = this.lowSpec ? THREE.NoToneMapping : THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 0.94;
     this.renderer.shadowMap.enabled = !this.lowSpec;
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
@@ -112,7 +112,7 @@ export class Game {
       62,
       Math.max(1, mount.clientWidth) / Math.max(1, mount.clientHeight),
       0.1,
-      this.lowSpec ? 165 : 275
+      this.lowSpec ? 160 : 275
     );
     this.camera.position.set(0, 3.1, 8.6);
 
@@ -145,12 +145,14 @@ export class Game {
     this.scene.add(this.heroLight);
 
     this.world = new World(this.scene);
-    this.world.shadows = !this.lowSpec;
     this.player = new Player(this.scene);
     this.particles = new Particles(this.scene);
     this.streaks = new SpeedStreaks(this.scene);
 
     this.applyPerfProfile();
+    this.snapColors(LOCS.metro);
+    this.world.ensureAhead(0);
+    this.renderer.compile(this.scene, this.camera);
     this.cb.perfMode?.(this.lowSpec);
     this.best = Number(localStorage.getItem('gr_best') || 0);
 
@@ -178,7 +180,9 @@ export class Game {
     this.sfx.ensure();
     this.sfx.startMusic();
     this.sfx.uiClick();
+    this.world.prewarmAll();
     this.world.reset();
+    this.world.ensureAhead(0);
     this.player.reset();
     this.pz = 0;
     this.dist = 0;
@@ -194,6 +198,7 @@ export class Game {
     this.invulnT = 0;
     this.fireT = 3.5;
     this.slowFrames = 0;
+    this.lowSlowFrames = 0;
     this.cb.graze(0);
     this.world.setPugPack(false);
     this.world.setBossDragon(false);
@@ -215,6 +220,7 @@ export class Game {
     this.world.setBossDragon(false);
     this.world.clearFire();
     this.world.reset();
+    this.world.ensureAhead(0);
     this.player.reset();
     this.pz = 0;
     this.state = 'menu';
@@ -259,16 +265,20 @@ export class Game {
   setOptimizationMode(on: boolean) {
     this.manualPerfOverride = true;
     this.lowSpec = on;
+    if (!on) this.ultraLow = false;
     this.applyPerfProfile();
   }
 
   private applyPerfProfile() {
     const dpr = window.devicePixelRatio || 1;
-    this.renderer.setPixelRatio(this.lowSpec ? 1 : Math.min(dpr, 1.5));
+    const targetDpr = this.lowSpec
+      ? Math.min(dpr, this.ultraLow ? 0.72 : 0.85)
+      : Math.min(dpr, 1.5);
+    this.renderer.setPixelRatio(targetDpr);
+    this.renderer.toneMapping = this.lowSpec ? THREE.NoToneMapping : THREE.ACESFilmicToneMapping;
 
     // Тени — отключаем полностью в lowSpec
     this.renderer.shadowMap.enabled = !this.lowSpec;
-    this.world.shadows = !this.lowSpec;
     this.dir.castShadow = !this.lowSpec;
 
     // Отключаем лишние динамические источники света на слабых GPU
@@ -276,6 +286,7 @@ export class Game {
     this.rim.visible = !this.lowSpec;
     this.point.visible = !this.lowSpec;
 
+    this.player.setFX(!this.lowSpec);
     this.player.group.traverse((c) => {
       const m = c as THREE.Mesh;
       if (!m.isMesh) return;
@@ -293,11 +304,15 @@ export class Game {
 
     this.particles.lowSpec = this.lowSpec;
     this.streaks.disabled = this.lowSpec;
-    this.world.genAhead = this.lowSpec ? 145 : GEN_AHEAD;
-    this.camera.far = this.lowSpec ? 165 : 275;
+    this.world.setLowSpec(this.lowSpec);
+    this.camera.far = this.lowSpec ? 160 : 275;
     this.camera.updateProjectionMatrix();
 
     this.setTargets(LOCS[this.curLoc]);
+    const fog = this.scene.fog as THREE.Fog;
+    if (fog.far > this.tgt.fogFar) fog.far = this.tgt.fogFar;
+    if (fog.near > this.tgt.fogNear) fog.near = this.tgt.fogNear;
+    this.world.ensureAhead(this.pz);
     this.onResize();
     if (this.paused) this.needPausedRender = true;
   }
@@ -396,17 +411,33 @@ export class Game {
     }
 
     // Авто-оптимизация при стабильных просадках FPS (если пользователь не выбрал режим вручную)
-    if (!this.lowSpec && !this.manualPerfOverride && this.state === 'play') {
-      if (rawDt > 0.036) {
-        this.slowFrames++;
-        if (this.slowFrames > 30) {
-          this.lowSpec = true;
-          this.applyPerfProfile();
-          this.cb.perfMode?.(true);
+    if (this.state === 'play') {
+      if (!this.lowSpec && !this.manualPerfOverride) {
+        if (rawDt > 0.036) {
+          this.slowFrames++;
+          if (this.slowFrames > 30) {
+            this.lowSpec = true;
+            this.applyPerfProfile();
+            this.cb.perfMode?.(true);
+          }
+        } else {
+          this.slowFrames = Math.max(0, this.slowFrames - 1);
         }
-      } else {
-        this.slowFrames = Math.max(0, this.slowFrames - 1);
+      } else if (this.lowSpec && !this.ultraLow) {
+        if (rawDt > 0.036) {
+          this.lowSlowFrames++;
+          if (this.lowSlowFrames > 45) {
+            this.ultraLow = true;
+            this.applyPerfProfile();
+          }
+        } else {
+          this.lowSlowFrames = Math.max(0, this.lowSlowFrames - 1);
+        }
       }
+    }
+
+    if (this.state === 'menu') {
+      this.world.prewarmStep();
     }
 
     let dt = rawDt;
@@ -759,17 +790,18 @@ export class Game {
   private setTargets(cfg: (typeof LOCS)[LocId]) {
     this.tgt.bg.setHex(cfg.bg);
     this.tgt.fog.setHex(cfg.fog);
-    this.tgt.fogNear = this.lowSpec ? Math.min(cfg.fogNear, 35) : cfg.fogNear;
-    this.tgt.fogFar = this.lowSpec ? Math.min(cfg.fogFar, 138) : cfg.fogFar;
+    this.tgt.fogNear = this.lowSpec ? Math.min(cfg.fogNear, 36) : cfg.fogNear;
+    this.tgt.fogFar = this.lowSpec ? Math.min(cfg.fogFar, 128) : cfg.fogFar;
     this.tgt.hemiSky.setHex(cfg.hemiSky);
     this.tgt.hemiGround.setHex(cfg.hemiGround);
     this.tgt.sun.setHex(cfg.sunColor);
-    this.hemi.intensity += (cfg.hemiInt - this.hemi.intensity) * 0.5;
-    this.dir.intensity += (cfg.sunInt - this.dir.intensity) * 0.5;
+    const lScale = this.lowSpec ? 0.84 : 1;
+    this.hemi.intensity += (cfg.hemiInt * lScale - this.hemi.intensity) * 0.5;
+    this.dir.intensity += (cfg.sunInt * lScale - this.dir.intensity) * 0.5;
     this.point.color.setHex(cfg.accent2);
     this.rim.color.setHex(cfg.accent2);
     this.renderer.toneMappingExposure = 0.94;
-    this.ambient.intensity = 0.3;
+    this.ambient.intensity = 0.3 * lScale;
     this.ambient.color.setHex(cfg.hemiSky);
     this.point.intensity = this.lowSpec ? 0 : 3;
     this.rim.intensity = this.lowSpec ? 0 : 0.4;
@@ -781,11 +813,12 @@ export class Game {
     const fog = this.scene.fog as THREE.Fog;
     fog.color.copy(this.tgt.fog);
     fog.near = this.tgt.fogNear; fog.far = this.tgt.fogFar;
+    const lScale = this.lowSpec ? 0.84 : 1;
     this.hemi.color.copy(this.tgt.hemiSky);
     this.hemi.groundColor.copy(this.tgt.hemiGround);
-    this.hemi.intensity = cfg.hemiInt;
+    this.hemi.intensity = cfg.hemiInt * lScale;
     this.dir.color.copy(this.tgt.sun);
-    this.dir.intensity = cfg.sunInt;
+    this.dir.intensity = cfg.sunInt * lScale;
   }
 
   private onResize = () => {

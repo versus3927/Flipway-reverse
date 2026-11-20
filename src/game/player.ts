@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { LANES, CASTLE_LANES, TUNNEL_H, PLAYER_H, MoveMode, easeInOut, easeOut } from './config';
-import { boxGeo, sphGeo, cylGeo, M, std, lam, sprite } from './meshes';
+import { boxGeo, sphGeo, cylGeo, M, std, lam, sprite, bakeGroup } from './meshes';
 
 export const ROLL_H = 0.78;     // высота хитбокса в кувырке
 const ROLL_DUR = 0.62;
@@ -49,6 +49,8 @@ export class Player {
   private headG: THREE.Group;
   private scarf: THREE.Mesh;
   private trail: THREE.Sprite;
+  private gl: THREE.Sprite;
+  showFX = true;
 
   justFlipped = false; justLanded = false;
 
@@ -58,7 +60,7 @@ export class Player {
   stunned = false;
 
   constructor(scene: THREE.Scene) {
-    // ═══ ЧИБИ-БОЕЦ (стиль Standoff 2) ═══
+    // ═══ ЧИБИ-БОЕЦ (стиль Standoff 2) — запечённые сегменты для минимальных draw-call'ов ═══
     const suit = std(0x2f3a4d, 0, 0, 0.85);        // тактический комбинезон
     const vestM = std(0x6d7a4f, 0, 0, 0.9);        // олива-жилет
     const dark = std(0x1a1f2b, 0, 0, 0.9);
@@ -67,44 +69,38 @@ export class Player {
     const skin = std(0xf0be95, 0, 0, 0.8);
     const orange = std(0xff7a29, 0xff5e00, 0.45, 0.6);
 
-    // корпус — маленький (чиби-пропорции)
-    const torso = M(boxGeo(0.5, 0.46, 0.32), suit, 0, 0.76, 0);
-    this.body.add(torso);
-    // тактический жилет с пластинами
-    const vest = M(boxGeo(0.56, 0.4, 0.38), vestM, 0, 0.78, 0);
-    this.body.add(vest);
-    this.body.add(M(boxGeo(0.2, 0.14, 0.05), dark, -0.14, 0.7, 0.2));   // подсумки
-    this.body.add(M(boxGeo(0.2, 0.14, 0.05), dark, 0.14, 0.7, 0.2));
-    this.body.add(M(boxGeo(0.13, 0.1, 0.05), orange, 0, 0.9, 0.2));      // шеврон
-    this.body.add(M(boxGeo(0.58, 0.07, 0.4), dark, 0, 0.6, 0));          // ремень
-    this.body.add(M(boxGeo(0.1, 0.09, 0.04), orange, 0, 0.6, 0.21));     // пряжка
-    // рюкзак-грави-модуль
-    this.body.add(M(boxGeo(0.34, 0.34, 0.16), std(0x232c3b, 0, 0, 0.55, 0.35), 0, 0.8, -0.24));
-    this.body.add(M(sphGeo(0.08, 8, 6), lam(0x3ddcff), 0, 0.88, -0.33));
-    const gl = sprite(0x3ddcff, 0.7, 0.75); gl.position.set(0, 0.88, -0.34);
-    this.body.add(gl);
+    const torsoRaw = new THREE.Group();
+    torsoRaw.add(M(boxGeo(0.5, 0.46, 0.32), suit, 0, 0.76, 0));
+    torsoRaw.add(M(boxGeo(0.56, 0.4, 0.38), vestM, 0, 0.78, 0));
+    torsoRaw.add(M(boxGeo(0.2, 0.14, 0.05), dark, -0.14, 0.7, 0.2));   // подсумки
+    torsoRaw.add(M(boxGeo(0.2, 0.14, 0.05), dark, 0.14, 0.7, 0.2));
+    torsoRaw.add(M(boxGeo(0.13, 0.1, 0.05), orange, 0, 0.9, 0.2));      // шеврон
+    torsoRaw.add(M(boxGeo(0.58, 0.07, 0.4), dark, 0, 0.6, 0));          // ремень
+    torsoRaw.add(M(boxGeo(0.1, 0.09, 0.04), orange, 0, 0.6, 0.21));     // пряжка
+    torsoRaw.add(M(boxGeo(0.34, 0.34, 0.16), std(0x232c3b, 0, 0, 0.55, 0.35), 0, 0.8, -0.24)); // рюкзак
+    torsoRaw.add(M(sphGeo(0.08, 8, 6), lam(0x3ddcff), 0, 0.88, -0.33)); // грави-ядро
+    torsoRaw.add(M(boxGeo(0.07, 0.24, 0.07), dark, 0.28, 0.5, 0.05));  // ножны
+    this.body.add(bakeGroup(torsoRaw));
+
+    this.gl = sprite(0x3ddcff, 0.7, 0.75); this.gl.position.set(0, 0.88, -0.34);
+    this.body.add(this.gl);
 
     // ── БОЛЬШАЯ ГОЛОВА (чиби) ──
-    this.headG = new THREE.Group();
+    const headRaw = new THREE.Group();
+    headRaw.add(M(boxGeo(0.62, 0.58, 0.56), skin, 0, 0, 0));
+    headRaw.add(M(boxGeo(0.635, 0.26, 0.575), mask, 0, -0.16, 0));
+    headRaw.add(M(boxGeo(0.635, 0.6, 0.2), mask, 0, 0.02, -0.19));
+    headRaw.add(M(boxGeo(0.64, 0.18, 0.585), mask, 0, 0.23, 0));
+    headRaw.add(M(boxGeo(0.66, 0.15, 0.06), std(0x0d1118, 0, 0, 0.4, 0.5), 0, 0.06, -0.28));
+    headRaw.add(M(boxGeo(0.2, 0.11, 0.035), std(0x18e0ff, 0x18e0ff, 0.9, 0.2, 0.6), -0.14, 0.06, -0.31));
+    headRaw.add(M(boxGeo(0.2, 0.11, 0.035), std(0x18e0ff, 0x18e0ff, 0.9, 0.2, 0.6), 0.14, 0.06, -0.31));
+    headRaw.add(M(boxGeo(0.66, 0.17, 0.6), std(0x33405a, 0, 0, 0.85), 0, 0.34, 0));
+    headRaw.add(M(boxGeo(0.6, 0.05, 0.26), std(0x33405a, 0, 0, 0.85), 0, 0.29, 0.38));
+    headRaw.add(M(boxGeo(0.12, 0.06, 0.03), orange, 0, 0.34, -0.31));
+    headRaw.add(M(cylGeo(0.1, 0.1, 0.07, 8), dark, -0.33, 0.05, 0).rotateZ(Math.PI / 2));
+    headRaw.add(M(cylGeo(0.1, 0.1, 0.07, 8), dark, 0.33, 0.05, 0).rotateZ(Math.PI / 2));
+    this.headG = bakeGroup(headRaw);
     this.headG.position.set(0, 1.12, 0);
-    const head = M(boxGeo(0.62, 0.58, 0.56), skin, 0, 0, 0);
-    this.headG.add(head);
-    // балаклава: закрывает низ лица и затылок
-    this.headG.add(M(boxGeo(0.635, 0.26, 0.575), mask, 0, -0.16, 0));
-    this.headG.add(M(boxGeo(0.635, 0.6, 0.2), mask, 0, 0.02, -0.19));
-    this.headG.add(M(boxGeo(0.64, 0.18, 0.585), mask, 0, 0.23, 0));
-    // тактические очки
-    this.headG.add(M(boxGeo(0.66, 0.15, 0.06), std(0x0d1118, 0, 0, 0.4, 0.5), 0, 0.06, -0.28));
-    const lensL = M(boxGeo(0.2, 0.11, 0.035), std(0x18e0ff, 0x18e0ff, 0.9, 0.2, 0.6), -0.14, 0.06, -0.31);
-    const lensR = M(boxGeo(0.2, 0.11, 0.035), std(0x18e0ff, 0x18e0ff, 0.9, 0.2, 0.6), 0.14, 0.06, -0.31);
-    this.headG.add(lensL, lensR);
-    // кепка козырьком назад
-    this.headG.add(M(boxGeo(0.66, 0.17, 0.6), std(0x33405a, 0, 0, 0.85), 0, 0.34, 0));
-    this.headG.add(M(boxGeo(0.6, 0.05, 0.26), std(0x33405a, 0, 0, 0.85), 0, 0.29, 0.38));
-    this.headG.add(M(boxGeo(0.12, 0.06, 0.03), orange, 0, 0.34, -0.31));
-    // наушники-гарнитура
-    this.headG.add(M(cylGeo(0.1, 0.1, 0.07, 8), dark, -0.33, 0.05, 0).rotateZ(Math.PI / 2));
-    this.headG.add(M(cylGeo(0.1, 0.1, 0.07, 8), dark, 0.33, 0.05, 0).rotateZ(Math.PI / 2));
     this.body.add(this.headG);
 
     // шарф/платок развевается
@@ -112,16 +108,17 @@ export class Player {
     this.body.add(this.scarf);
 
     const mkLimb = (px: number, py: number, w: number, len: number, mat: THREE.Material, shoe: boolean) => {
-      const g = new THREE.Group();
-      g.position.set(px, py, 0);
-      g.add(M(boxGeo(w, len, w), mat, 0, -len / 2 + 0.02, 0));
+      const raw = new THREE.Group();
+      raw.add(M(boxGeo(w, len, w), mat, 0, -len / 2 + 0.02, 0));
       if (shoe) {
-        g.add(M(boxGeo(w + 0.05, 0.12, w + 0.16), std(0xf2f4f7, 0, 0, 0.55), 0, -len + 0.03, -0.04));
-        g.add(M(boxGeo(w + 0.06, 0.04, w + 0.17), orange, 0, -len - 0.02, -0.04));
-        g.add(M(boxGeo(w + 0.03, 0.11, w + 0.02), std(0x3a4658, 0, 0, 0.85), 0, -len * 0.55, 0.01)); // наколенник
+        raw.add(M(boxGeo(w + 0.05, 0.12, w + 0.16), std(0xf2f4f7, 0, 0, 0.55), 0, -len + 0.03, -0.04));
+        raw.add(M(boxGeo(w + 0.06, 0.04, w + 0.17), orange, 0, -len - 0.02, -0.04));
+        raw.add(M(boxGeo(w + 0.03, 0.11, w + 0.02), std(0x3a4658, 0, 0, 0.85), 0, -len * 0.55, 0.01));
       } else {
-        g.add(M(boxGeo(w + 0.04, 0.14, w + 0.04), glove, 0, -len + 0.02, 0)); // перчатка
+        raw.add(M(boxGeo(w + 0.04, 0.14, w + 0.04), glove, 0, -len + 0.02, 0));
       }
+      const g = bakeGroup(raw);
+      g.position.set(px, py, 0);
       return g;
     };
     this.armL = mkLimb(-0.33, 0.94, 0.15, 0.44, suit, false);
@@ -129,9 +126,6 @@ export class Player {
     this.legL = mkLimb(-0.14, 0.52, 0.18, 0.5, dark, true);
     this.legR = mkLimb(0.14, 0.52, 0.18, 0.5, dark, true);
     this.body.add(this.armL, this.armR, this.legL, this.legR);
-
-    // ножны на бедре
-    this.body.add(M(boxGeo(0.07, 0.24, 0.07), dark, 0.28, 0.5, 0.05));
 
     this.body.position.y = -0.45;
     this.pivot.position.y = 0.45;
@@ -174,6 +168,12 @@ export class Player {
     );
     this.blob.rotation.x = -Math.PI / 2;
     scene.add(this.blob);
+  }
+
+  setFX(on: boolean) {
+    this.showFX = on;
+    this.gl.visible = on;
+    this.trail.visible = on;
   }
 
   private lanesArr() { return this.laneSet === 'castle' ? CASTLE_LANES : LANES; }
@@ -533,9 +533,11 @@ export class Player {
     }
 
     // след при большой скорости
-    const tm = this.trail.material as THREE.SpriteMaterial;
-    tm.opacity += ((speed > 26 ? 0.3 : 0) - tm.opacity) * Math.min(1, dt * 3);
-    this.trail.position.set(0, feet + 0.7, 1.3);
+    if (this.showFX) {
+      const tm = this.trail.material as THREE.SpriteMaterial;
+      tm.opacity += ((speed > 26 ? 0.3 : 0) - tm.opacity) * Math.min(1, dt * 3);
+      this.trail.position.set(0, feet + 0.7, 1.3);
+    }
 
     // тень — ложится на пол или на крышу поезда
     const surfY = this.flipT > 0.5 ? TUNNEL_H : this.baseY;

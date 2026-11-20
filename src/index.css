@@ -110,6 +110,7 @@ canvas { display: block; }
   -webkit-backdrop-filter: none;
 }
 
-.low-spec .scanlines {
+.low-spec .scanlines,
+.low-spec .vignette {
   display: none;
 }
